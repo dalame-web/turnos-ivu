@@ -2,8 +2,11 @@ name: Scrape IVU and Publish ICS
 
 on:
   schedule:
-    - cron: '0 5 * * *'   # diario 05:00 UTC
+    - cron: '0 5 * * *'   # cada día 05:00 UTC
   workflow_dispatch:
+
+permissions:
+  contents: write   # <--- necesario para pushear a gh-pages
 
 jobs:
   build:
@@ -20,37 +23,36 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install playwright beautifulsoup4 icalendar pytz
-
       - name: Install Playwright browsers & OS deps
         run: |
-          python -m playwright install chromium
-          python -m playwright install-deps
+          playwright install chromium
+          playwright install-deps
 
       - name: Run scraper
         env:
           IVU_USER: ${{ secrets.IVU_USER }}
           IVU_PASS: ${{ secrets.IVU_PASS }}
         run: |
-          mkdir -p debug
-          set -e
-          python scrape_and_publish.py > output.txt || (echo "SCRAPER FAILED"; set +e; cat output.txt; exit 1)
-          cat output.txt || true
-          mkdir -p calendars
-          mv -f turnos_*.ics calendars/ || true
+          mkdir -p public/calendars
+          python scrape_and_publish.py > output.txt || (cat output.txt && exit 1)
+          echo "----- Generated files -----"
+          ls -R public || true
 
       - name: Upload debug artifacts (if any)
-        if: always()
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: debug-artifacts
           path: |
             debug/**
             output.txt
-          if-no-files-found: ignore
 
+      # ==== Deploy a GitHub Pages ====
       - name: Publish to gh-pages
-        if: success()
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./calendars
+          publish_dir: ./public
+          force_orphan: true      # inicia historia limpia si la rama ya existe
+          commit_message: "Publish calendars"
+
