@@ -6,7 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # <--- necesario para pushear a gh-pages
+  contents: read          # para checkout
+  pages: write            # <--- necesario para desplegar Pages
+  id-token: write         # <--- necesario para deploy-pages
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -47,12 +53,19 @@ jobs:
             debug/**
             output.txt
 
-      # ==== Deploy a GitHub Pages ====
-      - name: Publish to gh-pages
-        uses: peaceiris/actions-gh-pages@v3
+      # ===== Deploy con el método oficial Pages =====
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
-          force_orphan: true      # inicia historia limpia si la rama ya existe
-          commit_message: "Publish calendars"
+          path: ./public
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
