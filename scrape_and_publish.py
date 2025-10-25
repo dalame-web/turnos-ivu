@@ -252,32 +252,28 @@ def try_weekview_polyfill_and_get_month(page):
     }""", "_-duty-table")
     page.wait_for_function("""()=>{const el=document.querySelector('#tableview'); return el && el.innerHTML && el.innerHTML.length>20;}""", timeout=20000)
     return page.inner_html("#tableview")
-
+    
 def fetch_day_html(page, ymd: str, empid: str | None):
     """
-    Devuelve el HTML del día {ymd} probando rutas en este orden:
-    1) /duty-details?beginDate=...
-    2) /mbweb/duty-details?beginDate=...    (tu instancia lo rechaza; se mantiene por compatibilidad)
-    3) _-duty-details-day?beginDate=...      (fragmento AJAX mediante polyfill WeekView)
+    Carga el detalle del día ejecutando WeekView.reload('_-duty-details-day?...')
+    directamente en el navegador y devuelve el HTML final del #tableview.
     """
-    def _has_unmapped_error(txt: str) -> bool:
-        return "There is no Action mapped for namespace" in (txt or "")
+    # Asegurar que el contenedor existe
+    page.evaluate("""
+        () => {
+          if (!document.querySelector('#tableview')) {
+              const d = document.createElement('div');
+              d.id = 'tableview';
+              document.body.appendChild(d);
+          }
+        }
+    """)
 
-    # 1) /duty-details (SIN /mbweb)
-    url1 = f"/duty-details?beginDate={ymd}"
-    if empid: url1 += f"&allocatedEmployeeId={empid}"
-    html = page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url1)
-    if html and not _has_unmapped_error(html):
-        return html
+    frag = f"_-duty-details-day?beginDate={ymd}&showUserInfo=true"
+    if empid:
+        frag += f"&allocatedEmployeeId={empid}"
 
-    # 2) /mbweb/duty-details (mantener por compatibilidad)
-    url2 = f"/mbweb/duty-details?beginDate={ymd}"
-    if empid: url2 += f"&allocatedEmployeeId={empid}"
-    html = page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url2)
-    if html and not _has_unmapped_error(html):
-        return html
-
-    # 3) Fragmento AJAX con WeekView (inyectamos polyfill si hace falta)
+    # Inyectar polyfill de WeekView si no existe
     page.evaluate("""
         () => {
           if (typeof window.WeekView === 'undefined') {
@@ -287,9 +283,8 @@ def fetch_day_html(page, ymd: str, empid: str | None):
                       return fetch(url, { credentials: 'same-origin' })
                         .then(r => r.text())
                         .then(html => {
-                           let el = document.querySelector('#tableview');
-                           if (!el) { el = document.createElement('div'); el.id='tableview'; document.body.appendChild(el); }
-                           el.innerHTML = html;
+                           const el = document.querySelector('#tableview');
+                           if (el) el.innerHTML = html;
                            return html;
                         });
                   }
@@ -297,9 +292,23 @@ def fetch_day_html(page, ymd: str, empid: str | None):
           }
         }
     """)
-    frag = f"_-duty-details-day?beginDate={ymd}&showUserInfo=true"
-    if empid: frag += f"&allocatedEmployeeId={empid}"
-    html = page.evaluate("""(f)=>WeekView.reload(f)""", frag)
+
+    # Vaciar y recargar
+    page.evaluate("""(frag)=>{ 
+        const el=document.querySelector('#tableview');
+        if (el) el.innerHTML='';
+        WeekView.reload(frag);
+    }""", frag)
+
+    # Esperar a que se cargue contenido
+    page.wait_for_function("""
+        () => {
+          const el=document.querySelector('#tableview');
+          return el && el.innerHTML && el.innerHTML.trim().length > 100;
+        }
+    """, timeout=30000)
+
+    html = page.inner_html("#tableview")
     return html
 
 # =========== main ===========
