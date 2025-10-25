@@ -279,104 +279,33 @@ def try_weekview_polyfill_and_get_month(page):
 
 def fetch_day_html(context, page, ymd: str, empid: str | None):
     """
-    Estrategia en cascada para obtener el HTML del día:
-    A) request.get a /mbweb/_-duty-details-day?...
-    B) request.get a /_-duty-details-day?...
-    C) Navegar a duty-details?beginDate=... y (si hace falta) inyectar WeekView.reload(...)
-    En cada GET añadimos cabeceras 'Ajax' para que el servidor reconozca la llamada.
+    GET directo del fragmento calculando la carpeta actual.
+    Ej: https://.../mbweb/main/ivu/desktop/_-duty-details-day?beginDate=...
     """
+    from urllib.parse import urljoin
+
+    # Construye la base hasta la carpeta actual
+    # p.ej. https://wcrew-ilsa.trenitalia.it/mbweb/main/ivu/desktop/
+    curr = page.url
+    base_dir = re.sub(r'[^/]+$', '', curr)
+
+    qs = f"beginDate={ymd}&showUserInfo=true"
+    if empid: qs += f"&allocatedEmployeeId={empid}"
+
+    url = urljoin(base_dir, f"_-duty-details-day?{qs}")
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "text/html, */*; q=0.01",
         "Referer": page.url,
+        "Accept-Language": "es-ES,es;q=0.9",
         "Cache-Control": "no-cache",
     }
-
-    def looks_like_shell(text: str) -> bool:
-        if not text:
-            return True
-        t = text.lower()
-        if "there is no action mapped" in t:
-            return True
-        # shell/landing sin tabla real
-        if '<div id="tableview"></div>' in t and "_-duty-table" in t:
-            return True
-        # login
-        if "j_security_check" in t and "login_form" in t:
-            return True
-        return False
-
-    # ---- A) /mbweb/_-duty-details-day
-    qs = f"beginDate={ymd}&showUserInfo=true"
-    if empid:
-        qs += f"&allocatedEmployeeId={empid}"
-    urlA = f"{BASE}/mbweb/_-duty-details-day?{qs}"
-    r = context.request.get(urlA, headers=headers)
+    r = context.request.get(url, headers=headers)
     if r.ok:
-        txt = r.text()
-        if not looks_like_shell(txt):
-            return txt
+        return r.text()
 
-    # ---- B) /_-duty-details-day
-    urlB = f"{BASE}/_-duty-details-day?{qs}"
-    r = context.request.get(urlB, headers=headers)
-    if r.ok:
-        txt = r.text()
-        if not looks_like_shell(txt):
-            return txt
-
-    # ---- C) Navegable: /mbweb/duty-details?beginDate=...  (y variante sin /mbweb/)
-    tried = []
-    for prefix in ("/mbweb", ""):
-        url = f"{BASE}{prefix}/duty-details?beginDate={ymd}"
-        if empid:
-            url += f"&allocatedEmployeeId={empid}"
-        tried.append(url)
-        try:
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            # si la propia página no rellenó el #tableview, fuerza recarga por WeekView
-            page.evaluate(
-                """
-                (frag)=>{
-                  if (typeof window.WeekView === 'undefined') {
-                      window.WeekView = {
-                        reload: function (frag2) {
-                          const u = (frag2.startsWith('/mbweb/')) ? frag2 : ('/mbweb/' + frag2);
-                          return fetch(u, { credentials:'same-origin',
-                                            headers: {'X-Requested-With':'XMLHttpRequest',
-                                                      'Accept':'text/html, */*; q=0.01'} })
-                            .then(r=>r.text())
-                            .then(h=>{ const el=document.querySelector('#tableview'); if(el) el.innerHTML=h; return h; });
-                        }
-                      };
-                  }
-                  const el = document.querySelector('#tableview');
-                  if (el && (!el.innerHTML || el.innerHTML.trim().length<100)) {
-                      WeekView.reload(frag);
-                  }
-                }
-                """,
-                f"_-duty-details-day?{qs}",
-            )
-            page.wait_for_function(
-                """
-                ()=>{ const el=document.querySelector('#tableview'); 
-                       if(!el||!el.innerHTML) return false; 
-                       const h=el.innerHTML.toLowerCase();
-                       return h.length>200 && (h.includes('<table')||h.includes('<td')||h.includes('hora')||h.includes('inicio'));
-                }
-                """,
-                timeout=25000,
-            )
-            return page.inner_html("#tableview")
-        except Exception:
-            continue
-
-    # nada funcionó; devolvemos lo que haya en #tableview para debug
-    try:
-        return page.inner_html("#tableview")
-    except Exception:
-        return ""
+    # Fallback (JS) si falla el GET directo
+    return weekview_reload_and_get_html(page, f"_-duty-details-day?{qs}")
 
 # ---------------- main ----------------
 def main():
