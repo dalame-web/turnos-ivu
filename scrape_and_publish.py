@@ -134,34 +134,39 @@ def login(context, user, pwd):
     page = context.new_page()
     page.goto(LOGIN_URL, timeout=60000)
     page.wait_for_load_state("domcontentloaded")
-    # Guardar estado inicial
     save_debug(page, "01_login_landing")
 
-    # Esperar a que el formulario exista (aunque esté hidden)
-    page.wait_for_selector("form#login_form", state="attached", timeout=20000)
+    # Espera a que el formulario exista (no exigimos que sea visible)
+    page.wait_for_selector("form#login_form", state="attached", timeout=30000)
 
-    # Rellenar y enviar por JS aunque esté oculto
-    page.evaluate("""
-        (u,p)=>{
-          const uf=document.querySelector('#j_username');
-          const pf=document.querySelector('#j_password');
-          if(uf) uf.value=u;
-          if(pf) pf.value=p;
-          const form=document.querySelector('form#login_form');
-          if(form){
-            form.action='/mbweb/j_security_check';
-            form.method='POST';
-            form.submit();
-          }
-        }
-    """, user, pwd)
+    # 1) Intento normal (rellenando y haciendo click en el botón)
+    try:
+        page.fill("#j_username", user, timeout=5000)
+        page.fill("#j_password", pwd, timeout=5000)
+        page.click('input.login_button[type="submit"]')
+    except Exception:
+        # 2) Fallback: enviar el formulario por JS con un solo argumento (objeto)
+        page.evaluate(
+            """(creds) => {
+                const uf = document.querySelector('#j_username');
+                const pf = document.querySelector('#j_password');
+                if (uf) uf.value = creds.u;
+                if (pf) pf.value = creds.p;
+                const form = document.querySelector('form#login_form');
+                if (form) {
+                  form.action = '/mbweb/j_security_check';
+                  form.method = 'POST';
+                  form.submit();
+                }
+            }""",
+            {"u": user, "p": pwd}
+        )
 
-    # Esperar navegación post-login (cualquier módulo)
+    # Esperar navegación post-login; si no llega, ir directo a Turnos
     try:
         page.wait_for_url(re.compile(r"/mbweb/(duties|messages|absence-overview|holiday-request)"), timeout=25000)
     except PwTimeout:
         save_debug(page, "02_after_submit_timeout")
-        # probar acceso directo a duties
         page.goto(DUTIES_URL, timeout=30000)
 
     save_debug(page, "03_after_login")
