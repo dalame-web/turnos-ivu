@@ -254,9 +254,53 @@ def try_weekview_polyfill_and_get_month(page):
     return page.inner_html("#tableview")
 
 def fetch_day_html(page, ymd: str, empid: str | None):
-    url = f"/mbweb/duty-details?beginDate={ymd}"
-    if empid: url += f"&allocatedEmployeeId={empid}"
-    return page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url)
+    """
+    Devuelve el HTML del día {ymd} probando rutas en este orden:
+    1) /duty-details?beginDate=...
+    2) /mbweb/duty-details?beginDate=...    (tu instancia lo rechaza; se mantiene por compatibilidad)
+    3) _-duty-details-day?beginDate=...      (fragmento AJAX mediante polyfill WeekView)
+    """
+    def _has_unmapped_error(txt: str) -> bool:
+        return "There is no Action mapped for namespace" in (txt or "")
+
+    # 1) /duty-details (SIN /mbweb)
+    url1 = f"/duty-details?beginDate={ymd}"
+    if empid: url1 += f"&allocatedEmployeeId={empid}"
+    html = page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url1)
+    if html and not _has_unmapped_error(html):
+        return html
+
+    # 2) /mbweb/duty-details (mantener por compatibilidad)
+    url2 = f"/mbweb/duty-details?beginDate={ymd}"
+    if empid: url2 += f"&allocatedEmployeeId={empid}"
+    html = page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url2)
+    if html and not _has_unmapped_error(html):
+        return html
+
+    # 3) Fragmento AJAX con WeekView (inyectamos polyfill si hace falta)
+    page.evaluate("""
+        () => {
+          if (typeof window.WeekView === 'undefined') {
+              window.WeekView = {
+                  reload: function (frag) {
+                      const url = frag.startsWith('/mbweb/') ? frag : '/mbweb/' + frag;
+                      return fetch(url, { credentials: 'same-origin' })
+                        .then(r => r.text())
+                        .then(html => {
+                           let el = document.querySelector('#tableview');
+                           if (!el) { el = document.createElement('div'); el.id='tableview'; document.body.appendChild(el); }
+                           el.innerHTML = html;
+                           return html;
+                        });
+                  }
+              };
+          }
+        }
+    """)
+    frag = f"_-duty-details-day?beginDate={ymd}&showUserInfo=true"
+    if empid: frag += f"&allocatedEmployeeId={empid}"
+    html = page.evaluate("""(f)=>WeekView.reload(f)""", frag)
+    return html
 
 # =========== main ===========
 def main():
