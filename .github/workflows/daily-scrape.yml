@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read          # para checkout
-  pages: write            # <--- necesario para desplegar Pages
-  id-token: write         # <--- necesario para deploy-pages
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: "pages"
@@ -44,6 +44,29 @@ jobs:
           echo "----- Generated files -----"
           ls -R public || true
 
+      # ⚠️ Aviso si no hay ICS
+      - name: Check ICS presence
+        run: |
+          if ! ls public/calendars/*.ics >/dev/null 2>&1; then
+            echo "::error::No se generaron archivos .ics en public/calendars"; 
+            exit 1
+          fi
+
+      # 🏠 Generar index.html con enlaces a los .ics
+      - name: Build index.html
+        run: |
+          python - <<'PY'
+          import os,glob,html
+          files=sorted(glob.glob('public/calendars/*.ics'))
+          os.makedirs('public',exist_ok=True)
+          with open('public/index.html','w',encoding='utf-8') as f:
+              f.write('<meta charset="utf-8"><h1>Calendarios de turnos</h1><ul>')
+              for p in files:
+                  name=os.path.basename(p)
+                  f.write(f'<li><a href="calendars/{html.escape(name)}">{html.escape(name)}</a></li>')
+              f.write('</ul>')
+          PY
+
       - name: Upload debug artifacts (if any)
         uses: actions/upload-artifact@v4
         if: always()
@@ -53,7 +76,6 @@ jobs:
             debug/**
             output.txt
 
-      # ===== Deploy con el método oficial Pages =====
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
