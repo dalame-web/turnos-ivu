@@ -49,7 +49,7 @@ def parse_table_html(table_html: str):
             if any(a in h for a in alias):
                 header_map[k] = i
 
-    for tr in table.find_all("tr"):
+    for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
         if not tds:
             continue
@@ -119,18 +119,8 @@ def parse_datetime(fecha_str: str, hora_str: str):
     fecha_str = (fecha_str or "").strip()
     hora_str = (hora_str or "").strip()
     meses = {
-        "ene": "01",
-        "feb": "02",
-        "mar": "03",
-        "abr": "04",
-        "may": "05",
-        "jun": "06",
-        "jul": "07",
-        "ago": "08",
-        "sep": "09",
-        "oct": "10",
-        "nov": "11",
-        "dic": "12",
+        "ene": "01", "feb": "02", "mar": "03", "abr": "04", "may": "05", "jun": "06",
+        "jul": "07", "ago": "08", "sep": "09", "oct": "10", "nov": "11", "dic": "12",
     }
     m = re.search(r"(\d{1,2})\s+([A-Za-zñ]{3,})\.?\s+(\d{4})", fecha_str)
     if m:
@@ -141,8 +131,8 @@ def parse_datetime(fecha_str: str, hora_str: str):
                 return TZ.localize(datetime.strptime(f"{y}-{mesn}-{d.zfill(2)} {hora_str}", fmt))
             except:
                 pass
-    for ff in ("%d/%m/%Y", "%Y-%m-%d"):
-        for fh in ("%H:%M", "%H"):
+    for ff in ("%d/%m/%Y","%Y-%m-%d"):
+        for fh in ("%H:%M","%H"):
             try:
                 return TZ.localize(datetime.strptime(f"{fecha_str} {hora_str}", f"{ff} {fh}"))
             except:
@@ -152,32 +142,29 @@ def parse_datetime(fecha_str: str, hora_str: str):
 def rows_to_events(rows):
     by_month = {}
     for r in rows:
-        start = parse_datetime(r.get("fecha", ""), r.get("hora_inicio", ""))
-        end = parse_datetime(r.get("fecha", ""), r.get("hora_fin", ""))
+        start = parse_datetime(r.get("fecha",""), r.get("hora_inicio",""))
+        end   = parse_datetime(r.get("fecha",""), r.get("hora_fin",""))
         if not start:
             continue
         if not end:
             end = start + timedelta(hours=8)
         ym = start.strftime("%Y-%m")
-        tipo = r.get("tipo", "")
-        ubic = r.get("ubicacion", "")
-        tren = r.get("tren", "")
-        by_month.setdefault(ym, []).append(
-            {
-                "summary": f"{tipo} - Tren {tren}" if tren else (tipo or "Turno"),
-                "start": start,
-                "end": end,
-                "description": f"Tipo: {tipo}\\nUbicación: {ubic}\\nTren: {tren}",
-            }
-        )
+        tipo = r.get("tipo","")
+        ubic = r.get("ubicacion","")
+        tren = r.get("tren","")
+        by_month.setdefault(ym, []).append({
+            "summary": f"{tipo} - Tren {tren}" if tren else (tipo or "Turno"),
+            "start": start, "end": end,
+            "description": f"Tipo: {tipo}\\nUbicación: {ubic}\\nTren: {tren}"
+        })
     return by_month
 
 def create_ics(year_month: str, events):
     outdir = pathlib.Path("public/calendars")
     outdir.mkdir(parents=True, exist_ok=True)
     cal = Calendar()
-    cal.add("prodid", "-//Turnos IVU//")
-    cal.add("version", "2.0")
+    cal.add("prodid","-//Turnos IVU//")
+    cal.add("version","2.0")
     for ev in events:
         e = Event()
         e.add("summary", ev["summary"])
@@ -187,7 +174,7 @@ def create_ics(year_month: str, events):
         e.add("dtstamp", datetime.now(TZ))
         cal.add_component(e)
     fname = outdir / f"turnos_{year_month}.ics"
-    with open(fname, "wb") as f:
+    with open(fname,"wb") as f:
         f.write(cal.to_ical())
     return str(fname)
 
@@ -241,41 +228,73 @@ def extract_dates_empid_from_any(html: str):
         empid = m.group(1)
     return sorted(dates), empid
 
-def try_weekview_polyfill_and_get_month(page):
-    page.wait_for_selector("#tableview", state="attached", timeout=15000)
-    page.evaluate(
-        """
+# -------- NUEVO: WeekView usando el directorio real de la URL ----------
+def weekview_reload_and_get_html(page, frag: str, wait_ms: int = 1200):
+    """
+    Ejecuta WeekView.reload(frag) resolviendo la URL final como:
+        <directorio_actual>/<frag>
+    En tu portal el directorio actual es /mbweb/main/ivu/desktop/,
+    por lo que:
+      "_-duty-table" -> /mbweb/main/ivu/desktop/_-duty-table
+      "_-duty-details-day?..." -> /mbweb/main/ivu/desktop/_-duty-details-day?...
+    """
+    # Asegura contenedor
+    page.evaluate("""
+        () => {
+          if (!document.querySelector('#tableview')) {
+              const d=document.createElement('div'); d.id='tableview'; document.body.appendChild(d);
+          }
+        }
+    """)
+
+    # Polyfill WeekView que usa la carpeta actual
+    page.evaluate("""
         () => {
           if (typeof window.WeekView === 'undefined') {
               window.WeekView = {
-                  reload: function (frag) {
-                      const url = (frag.startsWith('/mbweb/')) ? frag : ('/mbweb/' + frag);
-                      return fetch(url, { credentials: 'same-origin',
-                                          headers: {'X-Requested-With':'XMLHttpRequest',
-                                                    'Accept':'text/html, */*; q=0.01'} })
-                        .then(r => r.text())
-                        .then(html => {
-                           const el = document.querySelector('#tableview');
-                           if (el) el.innerHTML = html;
-                        }).catch(()=>{});
-                  }
+                reload: function (frag) {
+                  const loc = new URL(window.location.href);
+                  const dir = loc.pathname.replace(/[^/]+$/, ''); // carpeta: .../desktop/
+                  const url = frag.startsWith('/') ? frag : (dir + frag);
+                  return fetch(url, {
+                      credentials: 'same-origin',
+                      headers: {
+                        'X-Requested-With':'XMLHttpRequest',
+                        'Accept':'text/html, */*; q=0.01'
+                      }
+                  })
+                  .then(r => r.text())
+                  .then(html => {
+                     const el = document.querySelector('#tableview');
+                     if (el) el.innerHTML = html;
+                     return html;
+                  });
+                }
               };
           }
         }
-    """
-    )
-    page.evaluate(
-        """(frag)=>{ 
-        const el=document.querySelector('#tableview'); if(el) el.innerHTML='';
-        WeekView.reload(frag); 
-    }""",
-        "_-duty-table",
-    )
-    page.wait_for_function(
-        """()=>{const el=document.querySelector('#tableview'); return el && el.innerHTML && el.innerHTML.length>20;}""",
-        timeout=20000,
-    )
+    """)
+
+    # Vacía y recarga
+    page.evaluate("""(f)=>{ const c=document.querySelector('#tableview'); if(c) c.innerHTML=''; WeekView.reload(f); }""", frag)
+
+    # Espera contenido real
+    page.wait_for_function("""
+        () => {
+          const el = document.querySelector('#tableview');
+          if (!el || !el.innerHTML) return false;
+          const h = el.innerHTML.toLowerCase();
+          return h.length > 200 && (h.includes('<table') || h.includes('<td') || h.includes('inicio') || h.includes('término') || h.includes('termino'));
+        }
+    """, timeout=25000)
+
+    page.wait_for_timeout(wait_ms)
     return page.inner_html("#tableview")
+
+def try_weekview_polyfill_and_get_month(page):
+    """Carga la vista mensual usando el directorio real (sin prefijos fijos)."""
+    page.wait_for_selector("#tableview", state="attached", timeout=15000)
+    return weekview_reload_and_get_html(page, "_-duty-table")
 
 def fetch_day_html(context, page, ymd: str, empid: str | None):
     """
@@ -284,13 +303,13 @@ def fetch_day_html(context, page, ymd: str, empid: str | None):
     """
     from urllib.parse import urljoin
 
-    # Construye la base hasta la carpeta actual
-    # p.ej. https://wcrew-ilsa.trenitalia.it/mbweb/main/ivu/desktop/
+    # Carpeta actual, p.ej. .../mbweb/main/ivu/desktop/
     curr = page.url
     base_dir = re.sub(r'[^/]+$', '', curr)
 
     qs = f"beginDate={ymd}&showUserInfo=true"
-    if empid: qs += f"&allocatedEmployeeId={empid}"
+    if empid:
+        qs += f"&allocatedEmployeeId={empid}"
 
     url = urljoin(base_dir, f"_-duty-details-day?{qs}")
     headers = {
@@ -340,7 +359,7 @@ def main():
         page = login(context, user, pwd)
         ensure_turnos_visible(page)
 
-        # Mes actual en #tableview o lo pedimos por polyfill
+        # Mes actual en #tableview o lo pedimos por WeekView.reload('_-duty-table')
         full_html = page.content()
         soup = BeautifulSoup(full_html, "html.parser")
         tv = soup.select_one("#tableview")
@@ -361,7 +380,6 @@ def main():
         for idx, ymd in enumerate(dates):
             html_day = fetch_day_html(context, page, ymd, empid)
             if idx < 10:
-                # muestra para debug
                 try:
                     with open(f"debug/day_{ymd}.html", "w", encoding="utf-8") as f:
                         f.write(html_day)
@@ -387,3 +405,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
