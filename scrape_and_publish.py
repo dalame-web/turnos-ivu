@@ -27,7 +27,98 @@ def save_debug(page, name: str, html_override: str | None = None):
         pass
 
 # ---------------- parsers ----------------
+HORA_RE = r"([01]?\d|2[0-3]):[0-5]\d"
+
+def parse_day_ivu(day_html: str):
+    """
+    Parser específico para el detalle diario de IVU:
+    lee cabecera (Fecha / Número de turno / Inicio / Término) y
+    deduce ubicación (origen→destino) y número de tren si aparece.
+    Devuelve una lista con UNA fila (nuestro formato estándar).
+    """
+    soup = BeautifulSoup(day_html, "html.parser")
+
+    # 1) Cabecera con info de día
+    header = soup.select_one("table.allocation-info, table.duty_header_attribute, table.table-header-block")
+    if not header:
+        return []
+
+    def get_cont(label):
+        # Busca un <div class="desc">LABEL</div> y lee el siguiente <div class="cont">
+        for row in header.select("tr"):
+            descs = row.select("div.desc")
+            conts = row.select("div.cont")
+            for i, d in enumerate(descs):
+                t = d.get_text(strip=True).lower()
+                if label in t and i < len(conts):
+                    return conts[i].get_text(" ", strip=True)
+        return ""
+
+    fecha = get_cont("fecha")
+    tipo  = get_cont("número de turno") or get_cont("numero de turno") or get_cont("turno") or ""
+    hora_ini = get_cont("inicio")
+    hora_fin = get_cont("término") or get_cont("termino")
+
+    # 2) Deducir ubicación y número de tren desde la tabla de componentes (si existe)
+    body = soup.select_one("table.duty-components-table")
+    ubic = ""
+    tren = ""
+
+    if body:
+        # origen → destino: primer start_location_long_name y último end_location_long_name
+        starts = [td.get_text(" ", strip=True) for td in body.select("td.start_location_long_name")]
+        ends   = [td.get_text(" ", strip=True) for td in body.select("td.end_location_long_name")]
+        if starts and ends:
+            ubic = f"{starts[0]} → {ends[-1]}"
+        elif starts:
+            ubic = starts[0]
+        elif ends:
+            ubic = ends[-1]
+
+        # número de tren: celdas trip_numbers; si están vacías, heurística
+        trips = [td.get_text(" ", strip=True) for td in body.select("td.trip_numbers")]
+        first_trip = next((t for t in trips if t), "")
+        if first_trip:
+            m = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", first_trip)
+            if m:
+                tren = m.group(1)
+        if not tren:
+            # heurística general sobre todo el cuerpo
+            m = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", body.get_text(" ", strip=True))
+            if m:
+                tren = m.group(1)
+
+    # 3) Si faltan horas, intenta coger la primera y última del cuerpo
+    if (not hora_ini or not hora_fin) and body:
+        horas = re.findall(HORA_RE, body.get_text(" ", strip=True))
+        if horas:
+            if not hora_ini:
+                hora_ini = horas[0]
+            if not hora_fin:
+                hora_fin = horas[-1]
+
+    # Si aún faltan horas, intenta regex global
+    if not hora_ini or not hora_fin:
+        horas_all = re.findall(HORA_RE, soup.get_text(" ", strip=True))
+        if horas_all:
+            hora_ini = hora_ini or horas_all[0]
+            hora_fin = hora_fin or horas_all[-1]
+
+    # Si no hay fecha u horas, no devolvemos nada (que lo resuelva el fallback)
+    if not fecha or not hora_ini or not hora_fin:
+        return []
+
+    return [{
+        "fecha": fecha,
+        "hora_inicio": hora_ini,
+        "hora_fin": hora_fin,
+        "tipo": tipo or "Turno",
+        "ubicacion": ubic,
+        "tren": tren,
+    }]
+
 def parse_table_html(table_html: str):
+    # Parser genérico (por si alguna vista trae tabla tradicional)
     soup = BeautifulSoup(table_html, "html.parser")
     rows = []
     table = soup.find("table")
@@ -41,15 +132,15 @@ def parse_table_html(table_html: str):
         "hora_inicio": ["hora inicio", "inicio", "start", "inizio"],
         "hora_fin": ["hora fin", "fin", "end", "fine"],
         "tipo": ["tipo", "type", "servicio", "duty"],
-        "ubicacion": ["ubicación", "ubicacion", "location", "luogo"],
-        "tren": ["tren", "train", "n° treno", "numero tren", "nº tren"],
+        "ubicacion": ["ubicación", "ubicacion", "location", "luogo", "desde", "hacia"],
+        "tren": ["tren", "train", "n° treno", "numero tren", "nº tren", "viaje"],
     }
     for i, h in enumerate(headers):
         for k, alias in expected.items():
             if any(a in h for a in alias):
                 header_map[k] = i
 
-    for tr in soup.find_all("tr"):
+    for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if not tds:
             continue
@@ -62,22 +153,18 @@ def parse_table_html(table_html: str):
                 else (cells[idx] if idx < len(cells) else "")
             )
 
-        rows.append(
-            {
-                "fecha": cell("fecha", 0),
-                "hora_inicio": cell("hora_inicio", 1),
-                "hora_fin": cell("hora_fin", 2),
-                "tipo": cell("tipo", 3),
-                "ubicacion": cell("ubicacion", 4),
-                "tren": cell("tren", 5),
-            }
-        )
+        rows.append({
+            "fecha":       cell("fecha", 0),
+            "hora_inicio": cell("hora_inicio", 1),
+            "hora_fin":    cell("hora_fin", 2),
+            "tipo":        cell("tipo", 3),
+            "ubicacion":   cell("ubicacion", 4),
+            "tren":        cell("tren", 5),
+        })
     return rows
 
-HORA_RE = r"([01]?\d|2[0-3]):[0-5]\d"
-
 def parse_day_fallback(day_html: str, fecha_iso: str):
-    """Si no hay tabla, intenta reconstruir un único evento por regex."""
+    # Tu fallback anterior (se mantiene)
     soup = BeautifulSoup(day_html, "html.parser")
     text = soup.get_text("\n", strip=True)
 
@@ -104,29 +191,27 @@ def parse_day_fallback(day_html: str, fecha_iso: str):
 
     fecha_legible = datetime.strptime(fecha_iso, "%Y-%m-%d").strftime("%d %b %Y").lower().replace(".", "")
 
-    return [
-        {
-            "fecha": fecha_legible,
-            "hora_inicio": hora_ini,
-            "hora_fin": hora_fin,
-            "tipo": tipo,
-            "ubicacion": ubic,
-            "tren": tren,
-        }
-    ]
+    return [{
+        "fecha": fecha_legible,
+        "hora_inicio": hora_ini,
+        "hora_fin": hora_fin,
+        "tipo": tipo or "Turno",
+        "ubicacion": ubic,
+        "tren": tren,
+    }]
 
 def parse_datetime(fecha_str: str, hora_str: str):
     fecha_str = (fecha_str or "").strip()
     hora_str = (hora_str or "").strip()
     meses = {
-        "ene": "01", "feb": "02", "mar": "03", "abr": "04", "may": "05", "jun": "06",
-        "jul": "07", "ago": "08", "sep": "09", "oct": "10", "nov": "11", "dic": "12",
+        "ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
+        "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12",
     }
     m = re.search(r"(\d{1,2})\s+([A-Za-zñ]{3,})\.?\s+(\d{4})", fecha_str)
     if m:
         d, mes, y = m.group(1), m.group(2).lower()[:3], m.group(3)
         mesn = meses.get(mes, mes)
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H"):
+        for fmt in ("%Y-%m-%d %H:%M","%Y-%m-%d %H"):
             try:
                 return TZ.localize(datetime.strptime(f"{y}-{mesn}-{d.zfill(2)} {hora_str}", fmt))
             except:
@@ -228,17 +313,13 @@ def extract_dates_empid_from_any(html: str):
         empid = m.group(1)
     return sorted(dates), empid
 
-# -------- NUEVO: WeekView usando el directorio real de la URL ----------
+# -------- WeekView usando el directorio real de la URL ----------
 def weekview_reload_and_get_html(page, frag: str, wait_ms: int = 1200):
     """
     Ejecuta WeekView.reload(frag) resolviendo la URL final como:
-        <directorio_actual>/<frag>
-    En tu portal el directorio actual es /mbweb/main/ivu/desktop/,
-    por lo que:
-      "_-duty-table" -> /mbweb/main/ivu/desktop/_-duty-table
-      "_-duty-details-day?..." -> /mbweb/main/ivu/desktop/_-duty-details-day?...
+      <directorio_actual>/<frag>
+    En tu portal el directorio actual es /mbweb/main/ivu/desktop/.
     """
-    # Asegura contenedor
     page.evaluate("""
         () => {
           if (!document.querySelector('#tableview')) {
@@ -246,15 +327,13 @@ def weekview_reload_and_get_html(page, frag: str, wait_ms: int = 1200):
           }
         }
     """)
-
-    # Polyfill WeekView que usa la carpeta actual
     page.evaluate("""
         () => {
           if (typeof window.WeekView === 'undefined') {
               window.WeekView = {
                 reload: function (frag) {
                   const loc = new URL(window.location.href);
-                  const dir = loc.pathname.replace(/[^/]+$/, ''); // carpeta: .../desktop/
+                  const dir = loc.pathname.replace(/[^/]+$/, ''); // carpeta .../desktop/
                   const url = frag.startsWith('/') ? frag : (dir + frag);
                   return fetch(url, {
                       credentials: 'same-origin',
@@ -274,11 +353,7 @@ def weekview_reload_and_get_html(page, frag: str, wait_ms: int = 1200):
           }
         }
     """)
-
-    # Vacía y recarga
     page.evaluate("""(f)=>{ const c=document.querySelector('#tableview'); if(c) c.innerHTML=''; WeekView.reload(f); }""", frag)
-
-    # Espera contenido real
     page.wait_for_function("""
         () => {
           const el = document.querySelector('#tableview');
@@ -287,30 +362,19 @@ def weekview_reload_and_get_html(page, frag: str, wait_ms: int = 1200):
           return h.length > 200 && (h.includes('<table') || h.includes('<td') || h.includes('inicio') || h.includes('término') || h.includes('termino'));
         }
     """, timeout=25000)
-
     page.wait_for_timeout(wait_ms)
     return page.inner_html("#tableview")
 
 def try_weekview_polyfill_and_get_month(page):
-    """Carga la vista mensual usando el directorio real (sin prefijos fijos)."""
-    page.wait_for_selector("#tableview", state="attached", timeout=15000)
     return weekview_reload_and_get_html(page, "_-duty-table")
 
 def fetch_day_html(context, page, ymd: str, empid: str | None):
-    """
-    GET directo del fragmento calculando la carpeta actual.
-    Ej: https://.../mbweb/main/ivu/desktop/_-duty-details-day?beginDate=...
-    """
     from urllib.parse import urljoin
-
-    # Carpeta actual, p.ej. .../mbweb/main/ivu/desktop/
     curr = page.url
     base_dir = re.sub(r'[^/]+$', '', curr)
-
     qs = f"beginDate={ymd}&showUserInfo=true"
     if empid:
         qs += f"&allocatedEmployeeId={empid}"
-
     url = urljoin(base_dir, f"_-duty-details-day?{qs}")
     headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -322,8 +386,6 @@ def fetch_day_html(context, page, ymd: str, empid: str | None):
     r = context.request.get(url, headers=headers)
     if r.ok:
         return r.text()
-
-    # Fallback (JS) si falla el GET directo
     return weekview_reload_and_get_html(page, f"_-duty-details-day?{qs}")
 
 # ---------------- main ----------------
@@ -339,27 +401,20 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-gpu",
-            ],
+            args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-gpu"],
         )
         context = browser.new_context(
             locale="es-ES",
             timezone_id="Europe/Madrid",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/118.0.0.0 Safari/537.36"
-            ),
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/118.0.0.0 Safari/537.36"),
         )
         context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
 
         page = login(context, user, pwd)
         ensure_turnos_visible(page)
 
-        # Mes actual en #tableview o lo pedimos por WeekView.reload('_-duty-table')
         full_html = page.content()
         soup = BeautifulSoup(full_html, "html.parser")
         tv = soup.select_one("#tableview")
@@ -379,14 +434,17 @@ def main():
         all_events = {}
         for idx, ymd in enumerate(dates):
             html_day = fetch_day_html(context, page, ymd, empid)
-            if idx < 10:
+            if idx < 15:
                 try:
                     with open(f"debug/day_{ymd}.html", "w", encoding="utf-8") as f:
                         f.write(html_day)
                 except Exception:
                     pass
 
-            rows = parse_table_html(html_day)
+            # *** NUEVO ORDEN: parser IVU -> genérico -> fallback ***
+            rows = parse_day_ivu(html_day)
+            if not rows:
+                rows = parse_table_html(html_day)
             if not rows:
                 rows = parse_day_fallback(html_day, ymd)
 
@@ -405,4 +463,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
