@@ -28,64 +28,112 @@ def save_debug(page, name: str, html_override: str | None = None):
 
 # =========== parsers ===========
 def parse_table_html(table_html: str):
+    """
+    Parser principal: tabla con TH/TD ("Fecha", "Hora Inicio", "Hora Fin", "Tipo", "Ubicación", "Tren").
+    """
     soup = BeautifulSoup(table_html, "html.parser")
     rows = []
     table = soup.find("table")
-    if table:
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        header_map = {}
-        expected = {
-            "fecha": ["fecha", "date", "giorno"],
-            "hora_inicio": ["hora inicio", "inicio", "start", "inizio"],
-            "hora_fin": ["hora fin", "fin", "end", "fine"],
-            "tipo": ["tipo", "type", "servicio", "duty"],
-            "ubicacion": ["ubicación", "ubicacion", "location", "luogo"],
-            "tren": ["tren", "train", "n° treno", "numero tren"],
-        }
-        for i, h in enumerate(headers):
-            for k, alias in expected.items():
-                if any(a in h for a in alias):
-                    header_map[k] = i
-        for tr in table.find_all("tr"):
-            tds = tr.find_all("td")
-            if not tds:
-                continue
-            cells = [td.get_text(strip=True) for td in tds]
-            def cell(k, idx):
-                return (
-                    cells[header_map[k]]
-                    if k in header_map and header_map[k] < len(cells)
-                    else (cells[idx] if idx < len(cells) else "")
-                )
-            rows.append({
-                "fecha": cell("fecha", 0),
-                "hora_inicio": cell("hora_inicio", 1),
-                "hora_fin": cell("hora_fin", 2),
-                "tipo": cell("tipo", 3),
-                "ubicacion": cell("ubicacion", 4),
-                "tren": cell("tren", 5),
-            })
+    if not table:
         return rows
 
-    # fallback por tarjetas
-    for duty in soup.select(".duty, .duty-row, .ivu-row, .row"):
-        text = duty.get_text(" | ", strip=True)
-        parts = [p.strip() for p in text.split("|")]
+    headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+    header_map = {}
+    expected = {
+        "fecha": ["fecha","date","giorno"],
+        "hora_inicio": ["hora inicio","inicio","start","inizio"],
+        "hora_fin": ["hora fin","fin","end","fine"],
+        "tipo": ["tipo","type","servicio","duty"],
+        "ubicacion": ["ubicación","ubicacion","location","luogo"],
+        "tren": ["tren","train","n° treno","numero tren","nº tren","num tren"],
+    }
+    for i, h in enumerate(headers):
+        for k, alias in expected.items():
+            if any(a in h for a in alias):
+                header_map[k] = i
+
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        cells = [td.get_text(" ", strip=True) for td in tds]
+
+        def cell(k, idx):
+            return (
+                cells[header_map[k]]
+                if k in header_map and header_map[k] < len(cells)
+                else (cells[idx] if idx < len(cells) else "")
+            )
+
         rows.append({
-            "fecha": parts[0] if len(parts) > 0 else "",
-            "hora_inicio": parts[1] if len(parts) > 1 else "",
-            "hora_fin": parts[2] if len(parts) > 2 else "",
-            "tipo": parts[3] if len(parts) > 3 else "",
-            "ubicacion": parts[4] if len(parts) > 4 else "",
-            "tren": parts[5] if len(parts) > 5 else "",
+            "fecha":       cell("fecha", 0),
+            "hora_inicio": cell("hora_inicio", 1),
+            "hora_fin":    cell("hora_fin", 2),
+            "tipo":        cell("tipo", 3),
+            "ubicacion":   cell("ubicacion", 4),
+            "tren":        cell("tren", 5),
         })
     return rows
+
+HORA_RE = r"([01]?\d|2[0-3]):[0-5]\d"
+
+def parse_day_fallback(day_html: str, fecha_iso: str):
+    """
+    Fallback robusto para páginas de día sin tabla formal.
+    - Toma la primera hora del HTML como inicio y la última como fin.
+    - Intenta extraer: Tipo (código/etiqueta), Ubicación (palabras tipo MAD/MADA),
+      y Nº tren (palabra 'Tren' o número aislado de 3-5 dígitos).
+    Devuelve una lista de 0..n filas con el formato estándar.
+    """
+    soup = BeautifulSoup(day_html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+
+    horas = re.findall(HORA_RE, text)
+    if not horas:
+        return []  # no hay horas; sin datos no añadimos nada
+
+    hora_ini = horas[0]
+    hora_fin = horas[-1]
+
+    # Tipo: busca textos "código" en mayúsculas con guión (p.ej. F-AG03A) o etiquetas típicas (D, I, LD, CERRO T...)
+    m_tipo = re.search(r"\b([A-Z]{1,3}-[A-Z0-9]{2,6})\b", text)
+    tipo = m_tipo.group(1) if m_tipo else ""
+    if not tipo:
+        m_tipo2 = re.search(r"\b(D|LD|I|CERRO\s*T)\b", text)
+        tipo = m_tipo2.group(1) if m_tipo2 else ""
+
+    # Ubicación: toma palabras como MAD/MADA u otras estaciones (todas mayúsculas de 3–6 letras)
+    m_ubi = re.search(r"\b(MADA|MAD|ATO|BCN|VAL|SEV|ZGZ|SANTS|ATOCHA|CHAMARTIN)\b", text, re.IGNORECASE)
+    ubicacion = m_ubi.group(1) if m_ubi else ""
+
+    # Tren: busca "Tren 1234" o "nº 1234" o cualquier número de 3–5 dígitos cercano a la palabra 'Tren'
+    tren = ""
+    m_tren = re.search(r"(?:Tren|N[ºo]|n[ºo])\s*(\d{3,5})", text, re.IGNORECASE)
+    if m_tren:
+        tren = m_tren.group(1)
+    else:
+        # último recurso: cualquier número de 3–5 dígitos en el texto
+        m_tren2 = re.search(r"\b(\d{3,5})\b", text)
+        tren = m_tren2.group(1) if m_tren2 else ""
+
+    # La fecha la tenemos como ISO (YYYY-MM-DD) desde el enlace del mes.
+    fecha_legible = datetime.strptime(fecha_iso, "%Y-%m-%d").strftime("%d %b %Y").lower().replace(".", "")
+
+    return [{
+        "fecha": fecha_legible,
+        "hora_inicio": hora_ini,
+        "hora_fin": hora_fin,
+        "tipo": tipo,
+        "ubicacion": ubicacion,
+        "tren": tren,
+    }]
 
 def parse_datetime(fecha_str: str, hora_str: str):
     fecha_str = (fecha_str or "").strip()
     hora_str  = (hora_str or "").strip()
     meses = {"ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
              "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12"}
+    # "19 oct 2025" o "19 oct. 2025"
     m = re.search(r"(\d{1,2})\s+([A-Za-zñ]{3,})\.?\s+(\d{4})", fecha_str)
     if m:
         d, mes, y = m.group(1), m.group(2).lower()[:3], m.group(3)
@@ -106,8 +154,10 @@ def rows_to_events(rows):
     for r in rows:
         start = parse_datetime(r.get("fecha",""), r.get("hora_inicio",""))
         end   = parse_datetime(r.get("fecha",""), r.get("hora_fin",""))
-        if not start: continue
-        if not end: end = start + timedelta(hours=8)
+        if not start:  # si falla el parseo de fecha, ignora
+            continue
+        if not end:
+            end = start + timedelta(hours=8)
         ym = start.strftime("%Y-%m")
         tipo = r.get("tipo",""); ubic = r.get("ubicacion",""); tren = r.get("tren","")
         by_month.setdefault(ym, []).append({
@@ -130,7 +180,7 @@ def create_ics(year_month: str, events):
     with open(fname, "wb") as f: f.write(cal.to_ical())
     return str(fname)
 
-# =========== helpers específicos ===========
+# =========== helpers ===========
 def login(context, user, pwd):
     page = context.new_page()
     page.goto(LOGIN_URL, timeout=60000)
@@ -162,18 +212,15 @@ def ensure_turnos_visible(page):
         return
     except PwTimeout:
         pass
-    # Click en pestaña Turnos si existe
     for sel in ['a[href*="duties"]', 'li.mainmenu-duties a', 'a:has-text("Turnos")']:
         el = page.query_selector(sel)
         if el:
             el.click()
             break
     page.wait_for_load_state("domcontentloaded")
-    # como respaldo, espera a que exista el contenedor
     page.wait_for_selector("#tableview", timeout=15000)
 
 def extract_dates_empid_from_any(html: str):
-    """Extrae fechas/empid buscando en TODO el HTML."""
     dates = set(re.findall(r"beginDate=(\d{4}-\d{2}-\d{2})", html))
     empid = None
     m = re.search(r"allocatedEmployeeId=(\d+)", html)
@@ -181,8 +228,6 @@ def extract_dates_empid_from_any(html: str):
     return sorted(dates), empid
 
 def try_weekview_polyfill_and_get_month(page):
-    """Si no hay fechas, pide el fragmento del mes con un polyfill de WeekView."""
-    # asegura contenedor
     page.wait_for_selector("#tableview", state="attached", timeout=15000)
     page.evaluate("""
         () => {
@@ -201,7 +246,6 @@ def try_weekview_polyfill_and_get_month(page):
           }
         }
     """)
-    # Carga del mes
     page.evaluate("""(frag)=>{ 
         const el=document.querySelector('#tableview'); if(el) el.innerHTML='';
         WeekView.reload(frag); 
@@ -236,22 +280,17 @@ def main():
 
         page = login(context, user, pwd)
 
-        # 1) Asegúrate de que estamos viendo la cuadrícula de "Turnos"
+        # 1) Asegurar cuadrícula "Turnos"
         ensure_turnos_visible(page)
 
-        # 2) Intenta extraer fechas y empid del HTML completo
+        # 2) Extraer fechas/empid (del HTML completo; si no, WeekView polyfill)
         full_html = page.content()
-        month_html = ""
-        try:
-            soup = BeautifulSoup(full_html, "html.parser")
-            tv = soup.select_one("#tableview")
-            month_html = str(tv) if tv else full_html
-        except Exception:
-            month_html = full_html
+        soup = BeautifulSoup(full_html, "html.parser")
+        tv = soup.select_one("#tableview")
+        month_html = str(tv) if tv else full_html
 
         dates, empid = extract_dates_empid_from_any(full_html)
         if not dates:
-            # 3) Polyfill WeekView y pedir el mes
             month_html = try_weekview_polyfill_and_get_month(page)
             dates, empid = extract_dates_empid_from_any(month_html)
 
@@ -261,14 +300,31 @@ def main():
             save_debug(page, "05_no_dates_in_month", html_override=month_html)
             raise RuntimeError("No se encontraron fechas en el mes")
 
-        # 4) Pide cada día y parsea
+        # 3) Pedir cada día y parsear (con fallback). Guardar los 10 primeros HTML para debug.
         all_events = {}
-        for ymd in dates:
+        for idx, ymd in enumerate(dates):
             html_day = fetch_day_html(page, ymd, empid)
+            if idx < 10:
+                # guarda muestra para depurar si hiciera falta
+                try:
+                    with open(f"debug/day_{ymd}.html","w",encoding="utf-8") as f:
+                        f.write(html_day)
+                except Exception:
+                    pass
+
             rows = parse_table_html(html_day)
-            for ym, evs in rows_to_events(rows).items():
+            if not rows:
+                rows = parse_day_fallback(html_day, ymd)
+
+            month_map = rows_to_events(rows)
+            # trazas
+            total_evs = sum(len(v) for v in month_map.values())
+            print(f"[{ymd}] eventos detectados: {total_evs}")
+
+            for ym, evs in month_map.items():
                 all_events.setdefault(ym, []).extend(evs)
 
+        # 4) Generar ICS por mes
         for ym, evs in all_events.items():
             fname = create_ics(ym, evs)
             generated.append(fname)
