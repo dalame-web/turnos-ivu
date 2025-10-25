@@ -146,20 +146,52 @@ def login(context, user, pwd):
     return page
 
 def weekview_reload_and_get_html(page, path_fragment, wait_ms=1200):
-    # Asegura que WeekView existe
-    page.wait_for_function("()=> typeof WeekView !== 'undefined'", timeout=15000)
-    # Vacía el contenedor y lanza el reload
-    page.evaluate("""(frag)=>{
-        try{
-          const c=document.querySelector('#tableview'); if(c) c.innerHTML='';
-          if(window.WeekView && WeekView.reload){ WeekView.reload(frag); }
-        }catch(e){}
+    """
+    Lanza la carga del fragmento (mes o día) sobre #tableview.
+    Si WeekView no está definido aún, inyecta un polyfill equivalente.
+    """
+
+    # Asegura que existe #tableview en DOM
+    page.wait_for_selector("#tableview", state="attached", timeout=20000)
+
+    # Inyecta polyfill de WeekView si no existe
+    page.evaluate("""
+        () => {
+          if (typeof window.WeekView === 'undefined') {
+              window.WeekView = {
+                  reload: function (frag) {
+                      // GET relativo a /mbweb/
+                      const url = (frag.startsWith('/mbweb/')) ? frag : ('/mbweb/' + frag);
+                      return fetch(url, { credentials: 'same-origin' })
+                        .then(r => r.text())
+                        .then(html => {
+                           const el = document.querySelector('#tableview');
+                           if (el) el.innerHTML = html;
+                        })
+                        .catch(() => {});
+                  }
+              };
+          }
+        }
+    """)
+
+    # Vacía el contenedor y ejecuta la carga
+    page.evaluate("""(frag) => {
+        const c = document.querySelector('#tableview');
+        if (c) c.innerHTML = '';
+        if (window.WeekView && typeof window.WeekView.reload === 'function') {
+            window.WeekView.reload(frag);
+        }
     }""", path_fragment)
-    # Espera a que #tableview se rellene
-    page.wait_for_function("""()=>{
-        const el=document.querySelector('#tableview');
-        return el && el.innerHTML && el.innerHTML.trim().length>20;
-    }""", timeout=20000)
+
+    # Espera a que #tableview tenga contenido no trivial
+    page.wait_for_function("""
+        () => {
+          const el = document.querySelector('#tableview');
+          return !!(el && el.innerHTML && el.innerHTML.trim().length > 20);
+        }
+    """, timeout=20000)
+
     page.wait_for_timeout(wait_ms)
     return page.inner_html("#tableview")
 
