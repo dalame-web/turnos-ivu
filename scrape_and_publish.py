@@ -219,6 +219,7 @@ def main():
         # Ir a Turnos y dejar que la propia página cargue el mes vía WeekView
         page.goto(DUTIES_URL, timeout=60000)
         page.wait_for_load_state("domcontentloaded")
+        page.wait_for_selector("#tableview", state="attached", timeout=20000)
 
         # 1) MES: ejecutar WeekView.reload('_-duty-table') y extraer fechas
         month_html = weekview_reload_and_get_html(page, "_-duty-table")
