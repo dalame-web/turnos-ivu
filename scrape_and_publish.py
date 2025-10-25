@@ -255,10 +255,10 @@ def try_weekview_polyfill_and_get_month(page):
     
 def fetch_day_html(page, ymd: str, empid: str | None):
     """
-    Carga el detalle del día ejecutando WeekView.reload('_-duty-details-day?...')
-    directamente en el navegador y devuelve el HTML final del #tableview.
+    Carga el detalle del día ejecutando WeekView.reload con varias rutas posibles.
+    Devuelve el HTML final del #tableview (ya con contenido).
     """
-    # Asegurar que el contenedor existe
+    # Asegura contenedor
     page.evaluate("""
         () => {
           if (!document.querySelector('#tableview')) {
@@ -269,47 +269,60 @@ def fetch_day_html(page, ymd: str, empid: str | None):
         }
     """)
 
-    frag = f"_-duty-details-day?beginDate={ymd}&showUserInfo=true"
-    if empid:
-        frag += f"&allocatedEmployeeId={empid}"
-
-    # Inyectar polyfill de WeekView si no existe
+    # Inyecta (o reutiliza) WeekView y permite cambiar la base
     page.evaluate("""
         () => {
-          if (typeof window.WeekView === 'undefined') {
-              window.WeekView = {
-                  reload: function (frag) {
-                      const url = frag.startsWith('/mbweb/') ? frag : '/mbweb/' + frag;
-                      return fetch(url, { credentials: 'same-origin' })
-                        .then(r => r.text())
-                        .then(html => {
-                           const el = document.querySelector('#tableview');
-                           if (el) el.innerHTML = html;
-                           return html;
-                        });
-                  }
-              };
+          if (typeof window.__fetchFragment !== 'function') {
+            window.__fetchFragment = (base, frag) => {
+              // base: "", "/", "/mbweb/"
+              const url = (frag.startsWith('/')) ? (base.replace(/\/$/, '') + frag)
+                         : (base.replace(/\/$/, '') + '/' + frag);
+              return fetch(url, { credentials:'same-origin' })
+                .then(r => r.text())
+                .then(html => {
+                  let el = document.querySelector('#tableview');
+                  if (!el) { el = document.createElement('div'); el.id='tableview'; document.body.appendChild(el); }
+                  el.innerHTML = html;
+                  return html;
+                });
+            };
           }
         }
     """)
 
-    # Vaciar y recargar
-    page.evaluate("""(frag)=>{ 
-        const el=document.querySelector('#tableview');
-        if (el) el.innerHTML='';
-        WeekView.reload(frag);
-    }""", frag)
+    frag = f"_-duty-details-day?beginDate={ymd}&showUserInfo=true"
+    if empid:
+        frag += f"&allocatedEmployeeId={empid}"
 
-    # Esperar a que se cargue contenido
-    page.wait_for_function("""
-        () => {
-          const el=document.querySelector('#tableview');
-          return el && el.innerHTML && el.innerHTML.trim().length > 100;
-        }
-    """, timeout=30000)
+    # 3 intentos: ruta relativa, bajo '/', y bajo '/mbweb/'
+    variants = ["", "/", "/mbweb/"]
+    last_html = ""
 
-    html = page.inner_html("#tableview")
-    return html
+    for base in variants:
+        try:
+            # Vaciar antes de cada intento
+            page.evaluate("() => { const el = document.querySelector('#tableview'); if (el) el.innerHTML=''; }")
+
+            last_html = page.evaluate("""(b,f)=>window.__fetchFragment(b,f)""", base, frag)
+
+            # Espera a que haya contenido "real": tabla/td o al menos >200 chars
+            page.wait_for_function("""
+                () => {
+                  const el = document.querySelector('#tableview');
+                  if (!el || !el.innerHTML) return false;
+                  const html = el.innerHTML.trim();
+                  if (html.length < 200) return false;
+                  return /<table|<tr|<td|<th|Hora|Inicio|Fin/i.test(html);
+                }
+            """, timeout=20000)
+            # Éxito en este base
+            return page.inner_html("#tableview")
+        except Exception:
+            # siguiente variante
+            pass
+
+    # Si ninguna variante funcionó, devuelve lo último que se obtuvo (útil para debug)
+    return last_html or page.inner_html("#tableview")
 
 # =========== main ===========
 def main():
