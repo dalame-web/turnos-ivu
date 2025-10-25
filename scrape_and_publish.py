@@ -9,6 +9,7 @@ BASE = "https://wcrew-ilsa.trenitalia.it"
 LOGIN_URL = f"{BASE}"
 TZ = pytz.timezone("Europe/Madrid")
 
+# =========== util ===========
 def ensure_dir(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -25,7 +26,7 @@ def save_debug(page, name: str, html_override: str | None = None):
     except Exception:
         pass
 
-# ---------- Parsers ----------
+# =========== parsers ===========
 def parse_table_html(table_html: str):
     soup = BeautifulSoup(table_html, "html.parser")
     rows = []
@@ -52,7 +53,8 @@ def parse_table_html(table_html: str):
             cells = [td.get_text(strip=True) for td in tds]
             def cell(k, idx):
                 return (
-                    cells[header_map[k]] if k in header_map and header_map[k] < len(cells)
+                    cells[header_map[k]]
+                    if k in header_map and header_map[k] < len(cells)
                     else (cells[idx] if idx < len(cells) else "")
                 )
             rows.append({
@@ -64,6 +66,8 @@ def parse_table_html(table_html: str):
                 "tren": cell("tren", 5),
             })
         return rows
+
+    # fallback por tarjetas
     for duty in soup.select(".duty, .duty-row, .ivu-row, .row"):
         text = duty.get_text(" | ", strip=True)
         parts = [p.strip() for p in text.split("|")]
@@ -78,7 +82,8 @@ def parse_table_html(table_html: str):
     return rows
 
 def parse_datetime(fecha_str: str, hora_str: str):
-    fecha_str = (fecha_str or "").strip(); hora_str = (hora_str or "").strip()
+    fecha_str = (fecha_str or "").strip()
+    hora_str  = (hora_str or "").strip()
     meses = {"ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
              "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12"}
     m = re.search(r"(\d{1,2})\s+([A-Za-zñ]{3,})\.?\s+(\d{4})", fecha_str)
@@ -89,7 +94,7 @@ def parse_datetime(fecha_str: str, hora_str: str):
             try:
                 return TZ.localize(datetime.strptime(f"{y}-{mesn}-{d.zfill(2)} {hora_str}", fmt))
             except: pass
-    for ff in ("%d/%m/%Y", "%Y-%m-%d"):
+    for ff in ("%d/%m/%Y","%Y-%m-%d"):
         for fh in ("%H:%M","%H"):
             try:
                 return TZ.localize(datetime.strptime(f"{fecha_str} {hora_str}", f"{ff} {fh}"))
@@ -113,7 +118,6 @@ def rows_to_events(rows):
     return by_month
 
 def create_ics(year_month: str, events):
-    # <-- guardaremos en public/calendars/
     outdir = pathlib.Path("public/calendars")
     outdir.mkdir(parents=True, exist_ok=True)
     cal = Calendar(); cal.add('prodid','-//Turnos IVU//'); cal.add('version','2.0')
@@ -126,7 +130,7 @@ def create_ics(year_month: str, events):
     with open(fname, "wb") as f: f.write(cal.to_ical())
     return str(fname)
 
-# ---------- Navegación ----------
+# =========== helpers específicos ===========
 def login(context, user, pwd):
     page = context.new_page()
     page.goto(LOGIN_URL, timeout=60000)
@@ -151,25 +155,66 @@ def login(context, user, pwd):
     save_debug(page, "03_after_login")
     return page
 
-def get_month_html_from_page(page):
-    full = page.content()
-    soup = BeautifulSoup(full, "html.parser")
-    tv = soup.select_one("#tableview")
-    return str(tv) if tv else full
+def ensure_turnos_visible(page):
+    """Si no aparece #tableview, intenta activar la pestaña 'Turnos'."""
+    try:
+        page.wait_for_selector("#tableview", timeout=5000)
+        return
+    except PwTimeout:
+        pass
+    # Click en pestaña Turnos si existe
+    for sel in ['a[href*="duties"]', 'li.mainmenu-duties a', 'a:has-text("Turnos")']:
+        el = page.query_selector(sel)
+        if el:
+            el.click()
+            break
+    page.wait_for_load_state("domcontentloaded")
+    # como respaldo, espera a que exista el contenedor
+    page.wait_for_selector("#tableview", timeout=15000)
 
-def extract_dates_and_empid(month_html: str):
-    dates = set(re.findall(r"beginDate=(\d{4}-\d{2}-\d{2})", month_html))
+def extract_dates_empid_from_any(html: str):
+    """Extrae fechas/empid buscando en TODO el HTML."""
+    dates = set(re.findall(r"beginDate=(\d{4}-\d{2}-\d{2})", html))
     empid = None
-    m = re.search(r"allocatedEmployeeId=(\d+)", month_html)
+    m = re.search(r"allocatedEmployeeId=(\d+)", html)
     if m: empid = m.group(1)
     return sorted(dates), empid
 
-def fetch_day_html_via_fetch(page, ymd: str, empid: str | None):
+def try_weekview_polyfill_and_get_month(page):
+    """Si no hay fechas, pide el fragmento del mes con un polyfill de WeekView."""
+    # asegura contenedor
+    page.wait_for_selector("#tableview", state="attached", timeout=15000)
+    page.evaluate("""
+        () => {
+          if (typeof window.WeekView === 'undefined') {
+              window.WeekView = {
+                  reload: function (frag) {
+                      const url = (frag.startsWith('/mbweb/')) ? frag : ('/mbweb/' + frag);
+                      return fetch(url, { credentials: 'same-origin' })
+                        .then(r => r.text())
+                        .then(html => {
+                           const el = document.querySelector('#tableview');
+                           if (el) el.innerHTML = html;
+                        }).catch(()=>{});
+                  }
+              };
+          }
+        }
+    """)
+    # Carga del mes
+    page.evaluate("""(frag)=>{ 
+        const el=document.querySelector('#tableview'); if(el) el.innerHTML='';
+        WeekView.reload(frag); 
+    }""", "_-duty-table")
+    page.wait_for_function("""()=>{const el=document.querySelector('#tableview'); return el && el.innerHTML && el.innerHTML.length>20;}""", timeout=20000)
+    return page.inner_html("#tableview")
+
+def fetch_day_html(page, ymd: str, empid: str | None):
     url = f"/mbweb/duty-details?beginDate={ymd}"
     if empid: url += f"&allocatedEmployeeId={empid}"
-    html = page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url)
-    return html
+    return page.evaluate("""(u)=>fetch(u,{credentials:'same-origin'}).then(r=>r.text())""", url)
 
+# =========== main ===========
 def main():
     user = os.environ.get("IVU_USER"); pwd = os.environ.get("IVU_PASS")
     if not user or not pwd: raise RuntimeError("Faltan IVU_USER/IVU_PASS")
@@ -191,19 +236,36 @@ def main():
 
         page = login(context, user, pwd)
 
-        # El mes ya está pintado tras el login
-        month_html = get_month_html_from_page(page)
+        # 1) Asegúrate de que estamos viendo la cuadrícula de "Turnos"
+        ensure_turnos_visible(page)
+
+        # 2) Intenta extraer fechas y empid del HTML completo
+        full_html = page.content()
+        month_html = ""
+        try:
+            soup = BeautifulSoup(full_html, "html.parser")
+            tv = soup.select_one("#tableview")
+            month_html = str(tv) if tv else full_html
+        except Exception:
+            month_html = full_html
+
+        dates, empid = extract_dates_empid_from_any(full_html)
+        if not dates:
+            # 3) Polyfill WeekView y pedir el mes
+            month_html = try_weekview_polyfill_and_get_month(page)
+            dates, empid = extract_dates_empid_from_any(month_html)
+
         save_debug(page, "04_month_html", html_override=month_html)
 
-        dates, empid = extract_dates_and_empid(month_html)
         if not dates:
             save_debug(page, "05_no_dates_in_month", html_override=month_html)
             raise RuntimeError("No se encontraron fechas en el mes")
 
+        # 4) Pide cada día y parsea
         all_events = {}
         for ymd in dates:
-            day_html = fetch_day_html_via_fetch(page, ymd, empid)
-            rows = parse_table_html(day_html)
+            html_day = fetch_day_html(page, ymd, empid)
+            rows = parse_table_html(html_day)
             for ym, evs in rows_to_events(rows).items():
                 all_events.setdefault(ym, []).extend(evs)
 
@@ -213,7 +275,6 @@ def main():
 
         browser.close()
 
-    # Imprime rutas completas (útil para el deploy)
     print("GENERATED_FILES=" + ",".join(generated))
 
 if __name__ == "__main__":
