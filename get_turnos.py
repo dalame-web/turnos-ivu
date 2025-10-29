@@ -346,5 +346,17 @@ def main():
                     f.write("No se pudo obtener información de ningún día del mes.\n")
                 log.warning(f"No se detectaron días/turnos en {yy}-{mm:02d}. Verifica rutas o credenciales.")
 
+# === DEBUG helper ===
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
+def snapshot(name: str, content: str):
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"[DEBUG] snapshot -> {path}")
+    except Exception as e:
+        log.warning(f"[DEBUG] no se pudo escribir snapshot {name}: {e}")
+
 if __name__ == "__main__":
     main()
