@@ -1,0 +1,45 @@
+name: get-turnos (Parte 1)
+
+on:
+  workflow_dispatch: {}   # permite "Run workflow" manual desde Actions
+  # programado opcional para pruebas nocturnas:
+  # schedule:
+  #   - cron: "15 3 * * *"  # 03:15 UTC
+
+jobs:
+  run-get-turnos:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # no vamos a hacer push en esta prueba
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run get_turnos.py
+        env:
+          IVU_USER: ${{ secrets.IVU_USER }}
+          IVU_PASS: ${{ secrets.IVU_PASS }}
+          # Opcionales:
+          # IVU_BASE_URL: https://wcrew-ilsa.trenitalia.it
+          # TURNOS_DATA_DIR: ./data
+          # MESES_A_LEER: "1"
+        run: |
+          python get_turnos.py
+
+      - name: Upload JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnos-json
+          path: data/
+          if-no-files-found: warn
