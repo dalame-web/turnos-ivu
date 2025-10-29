@@ -50,5 +50,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: turnos-json
-          path: ${{ github.workspace }}/data/**
+          path: |
+            ${{ github.workspace }}/data/**
           if-no-files-found: warn
+
