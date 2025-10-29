@@ -34,13 +34,20 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/data"
 
-      - name: Run get_turnos_v13.py
+- name: Show repo files
+  run: |
+    pwd
+    ls -la
+    echo "---- git status ----"
+    git status --porcelain
+
+      - name: Run get_turnos.py
         env:
           IVU_USER: ${{ secrets.IVU_USER }}
           IVU_PASS: ${{ secrets.IVU_PASS }}
           TURNOS_DATA_DIR: ${{ github.workspace }}/data
         run: |
-          python get_turnos_v13.py
+          python get_turnos.py
 
       - name: List outputs
         if: always()
