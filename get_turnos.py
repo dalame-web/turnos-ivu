@@ -8,7 +8,7 @@ from typing import List, Dict, Optional, Tuple
 import logging
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # ---------------- Config ----------------
 BASE = os.getenv("IVU_BASE_URL", "https://wcrew-ilsa.trenitalia.it").rstrip("/")
@@ -23,8 +23,11 @@ HTTP_TIMEOUT = 30
 RETRIES = 3
 SLEEP = 1.2
 
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S"
+)
 log = logging.getLogger("get_turnos")
 
 # ---------------- Utils ----------------
@@ -166,41 +169,39 @@ def do_login(s: requests.Session, user: str, pwd: str):
     # Entramos primero a /mbweb para obtener cookies base
     _ = http_get(s, urljoin(BASE, "/mbweb/"))
     data = {"j_username": user, "j_password": pwd}
-    r = http_post(s, urljoin(BASE, LOGIN_POST), data=data)
+    _ = http_post(s, urljoin(BASE, LOGIN_POST), data=data)
     # Verificación mínima
     r2 = http_get(s, urljoin(BASE, DUTIES_PATH))
     if "Cerrar sesión" not in r2.text and "logout" not in r2.text.lower():
         raise RuntimeError("Login fallido (no aparece sesión activa)")
     log.info("Login correcto ✅")
+    return r2  # devolvemos la respuesta de duties para snapshot
+
+def get_base_dir_from_duties_url(duties_url: str) -> str:
+    # ejemplo: /mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop
+    p = urlparse(duties_url)
+    return re.sub(r"/[^/]*$", "", p.path)
 
 def candidate_month_urls(base_dir_from_duties: str) -> List[str]:
     """
     Devuelve posibles rutas AJAX para _-duty-table.
     En tu portal puede estar colgado en varias ubicaciones.
     """
-    cands = []
-    # 1) relativa al directorio donde vive 'duties'
-    cands.append(base_dir_from_duties.rstrip("/") + "/_-duty-table")
-    cands.append(base_dir_from_duties.rstrip("/") + "/_-duty-table?force=1")
-    # 2) directo en /mbweb/
-    cands.append("/mbweb/_-duty-table")
-    cands.append("/mbweb/_-duty-table?force=1")
-    # 3) raíz (por si el servidor lo expone así)
-    cands.append("/_-duty-table")
-    cands.append("/_-duty-table?force=1")
+    bd = base_dir_from_duties.rstrip("/")
+    cands = [
+        f"{bd}/_-duty-table",
+        f"{bd}/_-duty-table?force=1",
+        "/mbweb/_-duty-table",
+        "/mbweb/_-duty-table?force=1",
+        "/_-duty-table",
+        "/_-duty-table?force=1",
+    ]
     # quitar duplicados conservando orden
     seen=set(); out=[]
     for u in cands:
         if u not in seen:
             seen.add(u); out.append(u)
     return out
-
-def get_base_dir_from_duties(s: requests.Session) -> str:
-    r = http_get(s, urljoin(BASE, DUTIES_PATH))
-    # ejemplo: /mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop
-    from urllib.parse import urlparse
-    p = urlparse(r.url)
-    return re.sub(r"/[^/]*$", "", p.path)
 
 def fetch_month_ajax_html(s: requests.Session, base_dir: str) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -267,6 +268,18 @@ def iter_month_days(year: int, month: int) -> List[str]:
     last = calendar.monthrange(year, month)[1]
     return [f"{year:04d}-{month:02d}-{d:02d}" for d in range(1, last+1)]
 
+# === DEBUG helper ===
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
+def snapshot(name: str, content: str):
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"[DEBUG] snapshot -> {path}")
+    except Exception as e:
+        log.warning(f"[DEBUG] no se pudo escribir snapshot {name}: {e}")
+
 # ---------------- Main ----------------
 def main():
     user = os.getenv("IVU_USER"); pwd = os.getenv("IVU_PASS")
@@ -284,17 +297,21 @@ def main():
         })
 
         log.info("Haciendo login en IVU…")
-        do_login(s, user, pwd)
+        r_duties = do_login(s, user, pwd)
+        # --- DEBUG 1: snapshot de la vista duties y base_dir calculado
+        snapshot("00_duties.html", r_duties.text)
+        base_dir = get_base_dir_from_duties_url(r_duties.url)
+        log.info(f"[DEBUG] base_dir calculado = {base_dir}")
 
         months = months_to_read()
         log.info(f"Meses a leer: {months}")
 
         for (yy, mm) in months:
-            # 1) base_dir (donde cuelgan los endpoints en tu sesión)
-            base_dir = get_base_dir_from_duties(s)
-
-            # 2) intentar obtener HTML del mes por AJAX
+            # 1) intentar obtener HTML del mes por AJAX
             month_html, used_url = fetch_month_ajax_html(s, base_dir)
+            log.info(f"[DEBUG] _-duty-table usado = {used_url}")
+            if month_html:
+                snapshot("01_month.html", month_html)
 
             dates: List[str] = []
             empid: Optional[str] = None
@@ -304,16 +321,24 @@ def main():
                 # filtramos por el mes/ano que toca
                 dates = [d for d in dts if d.startswith(f"{yy:04d}-{mm:02d}")]
                 empid = emp
+            log.info(f"[{yy}-{mm:02d}] Fechas encontradas en _-duty-table: {len(dates)}")
 
-            # 3) Fallback: si seguimos sin fechas, hacemos barrido día a día
+            # 2) Fallback: si seguimos sin fechas, barrido diario
             if not dates:
                 log.warning(f"No se obtuvieron fechas por _-duty-table para {yy}-{mm:02d}. Activo barrido diario.")
                 dates = iter_month_days(yy, mm)
 
             by_month: Dict[str, List[Dia]] = {}
+            tested = 0  # para snapshots de los 3 primeros días
             for ymd in dates:
                 try:
                     href, html_day = fetch_day_html(s, base_dir, ymd, empid)
+                    # --- DEBUG 2: snapshot de los primeros 3 días probados
+                    if tested < 3:
+                        snapshot(f"day_{ymd}.html", html_day)
+                        log.info(f"[DEBUG] Probed day URL = {href}")
+                        tested += 1
+
                     dia = parse_day_html(ymd, html_day, href)
                     ym = ymd[:7]
                     by_month.setdefault(ym, []).append(dia)
@@ -324,7 +349,7 @@ def main():
                 except Exception as ex:
                     log.warning(f"[{ymd}] Error leyendo día: {ex}")
 
-            # 4) Guardar JSON por mes
+            # 3) Guardar JSON por mes
             if by_month:
                 now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
                 for ym, days in sorted(by_month.items()):
@@ -346,17 +371,6 @@ def main():
                     f.write("No se pudo obtener información de ningún día del mes.\n")
                 log.warning(f"No se detectaron días/turnos en {yy}-{mm:02d}. Verifica rutas o credenciales.")
 
-# === DEBUG helper ===
-DEBUG_DIR = os.path.join(DATA_DIR, "debug")
-def snapshot(name: str, content: str):
-    try:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        path = os.path.join(DEBUG_DIR, name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        log.info(f"[DEBUG] snapshot -> {path}")
-    except Exception as e:
-        log.warning(f"[DEBUG] no se pudo escribir snapshot {name}: {e}")
-
 if __name__ == "__main__":
     main()
+
