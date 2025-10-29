@@ -447,6 +447,20 @@ def main():
 
     if not all_days:
         logger.warning("No se detectaron días/turnos. Revisa selectores o accesos.")
+    
+    # --- Al final de main() ---
+    if not all_days:
+        logger.warning("No se detectaron días/turnos. Revisa selectores o accesos.")
+        marker = os.path.join(DATA_DIR, "NO_DATA.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(
+                "No se generaron JSON de turnos.\n"
+                "Posibles causas:\n"
+                "- Login correcto pero sin días detectados en el mes.\n"
+                "- Selectores HTML desajustados.\n"
+                "- La vista del calendario no responde/URL distinta.\n"
+            )
+        logger.info(f"Marcador escrito: {marker}")
 
 if __name__ == "__main__":
     main()
