@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, json, time, hashlib
+import os, re, sys, json, time, hashlib, calendar
 import datetime as dt
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
@@ -12,11 +12,12 @@ from urllib.parse import urljoin
 
 # ---------------- Config ----------------
 BASE = os.getenv("IVU_BASE_URL", "https://wcrew-ilsa.trenitalia.it").rstrip("/")
-# En IVU tu login real es /mbweb/j_security_check (según HTML de credenciales)
 LOGIN_POST = "/mbweb/j_security_check"
-DUTIES_PATH = "/mbweb/main/ivu/desktop/duties"  # vista que define el directorio base
+# Página visible de turnos (nos da el "entorno" y cookies correctas)
+DUTIES_PATH = "/mbweb/main/ivu/desktop/duties"
+
 DATA_DIR = os.getenv("TURNOS_DATA_DIR", "./data")
-MESES_A_LEER = int(os.getenv("MESES_A_LEER", "1"))  # actual (+1 si quieres el siguiente)
+MESES_A_LEER = int(os.getenv("MESES_A_LEER", "1"))  # 1 = mes actual, 2 = actual + siguiente
 
 HTTP_TIMEOUT = 30
 RETRIES = 3
@@ -59,7 +60,7 @@ def http_post(s: requests.Session, url: str, data=None, **kw) -> requests.Respon
             time.sleep(SLEEP * (i+1))
     raise last
 
-def month_list() -> List[Tuple[int,int]]:
+def months_to_read() -> List[Tuple[int,int]]:
     today = dt.date.today()
     out = []
     y, m = today.year, today.month
@@ -112,19 +113,15 @@ def is_overnight(start_hhmm: Optional[str], end_hhmm: Optional[str]) -> bool:
 
 def parse_day_html(date_str: str, html: str, href: str) -> Dia:
     soup = BeautifulSoup(html, "html.parser")
-    # cabecera/tabla (cuando IVU la pinta)
-    head = soup.select_one("table.allocation-info, table.duty_header_attribute, table.table-header-block")
+    head_txt = soup.get_text(" ", strip=True)
+
+    # tabla principal si existe
     body = soup.select_one("table.duty-components-table")
-    tipo = None; start=None; end=None; f=None; t=None; tren=None
+    tipo=None; start=None; end=None; f=None; t=None; tren=None
     labels = []
 
-    # tipo desde cabecera (si existe)
-    if head:
-        # buscar texto general
-        labels.append(head.get_text(" ", strip=True))
-
     if body:
-        # horas: primera start y última end
+        labels.append(body.get_text(" ", strip=True))
         starts = [td.get_text(" ", strip=True) for td in body.select("td.start_time")]
         ends   = [td.get_text(" ", strip=True) for td in body.select("td.end_time")]
         locs_f = [td.get_text(" ", strip=True) for td in body.select("td.start_location_long_name")]
@@ -133,12 +130,9 @@ def parse_day_html(date_str: str, html: str, href: str) -> Dia:
         if ends:   end   = norm_hhmm(ends[-1])
         if locs_f: f = locs_f[0]
         if locs_t: t = locs_t[-1]
-        # tipo aproximado
         tipo_el = body.select_one("td.component-type, td.type")
         if tipo_el:
             tipo = tipo_el.get_text(" ", strip=True) or None
-        labels.append(body.get_text(" ", strip=True))
-        # tren
         trips = [td.get_text(" ", strip=True) for td in body.select("td.trip_numbers")]
         first = next((x for x in trips if x), "")
         m = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", first) if first else None
@@ -147,14 +141,15 @@ def parse_day_html(date_str: str, html: str, href: str) -> Dia:
             m2 = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", body.get_text(" ", strip=True))
             tren = m2.group(1) if m2 else None
 
-    # fallback: horas por regex global
+    # fallback global a horas si no hay tabla
     if not start or not end:
-        horas = re.findall(HORA, soup.get_text(" ", strip=True))
+        horas = re.findall(HORA, head_txt)
         if horas:
             if not start: start = norm_hhmm(":".join(horas[0]))
             if not end:   end   = norm_hhmm(":".join(horas[-1]))
 
     has_hours = bool(start and end)
+    labels.append(head_txt)
     status = detect_status(labels, has_hours)
     overnight = is_overnight(start, end)
 
@@ -166,41 +161,68 @@ def parse_day_html(date_str: str, html: str, href: str) -> Dia:
         notes=[]
     )
 
-# ---------------- Core (AJAX endpoints) ----------------
+# ---------------- Core ----------------
 def do_login(s: requests.Session, user: str, pwd: str):
-    # Necesitamos cookie de sesión de /mbweb/ antes del POST
-    landing = http_get(s, urljoin(BASE, "/mbweb/"))
-    # POST del formulario estándar j_security_check
+    # Entramos primero a /mbweb para obtener cookies base
+    _ = http_get(s, urljoin(BASE, "/mbweb/"))
     data = {"j_username": user, "j_password": pwd}
     r = http_post(s, urljoin(BASE, LOGIN_POST), data=data)
-    if r.status_code not in (200, 302):
-        raise RuntimeError("Login HTTP inesperado")
-    # comprobar que entrar en duties responde autenticado
+    # Verificación mínima
     r2 = http_get(s, urljoin(BASE, DUTIES_PATH))
     if "Cerrar sesión" not in r2.text and "logout" not in r2.text.lower():
         raise RuntimeError("Login fallido (no aparece sesión activa)")
     log.info("Login correcto ✅")
 
-def get_base_dir_and_month_html(s: requests.Session) -> Tuple[str, str]:
+def candidate_month_urls(base_dir_from_duties: str) -> List[str]:
     """
-    Abre /duties para obtener el directorio base (/mbweb/main/ivu/desktop/)
-    y pide por AJAX '_-duty-table' para volcar el HTML del mes.
+    Devuelve posibles rutas AJAX para _-duty-table.
+    En tu portal puede estar colgado en varias ubicaciones.
     """
-    duties = http_get(s, urljoin(BASE, DUTIES_PATH))
-    # Obtener el directorio base de la URL final:
-    # p.ej. https://.../mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop/
+    cands = []
+    # 1) relativa al directorio donde vive 'duties'
+    cands.append(base_dir_from_duties.rstrip("/") + "/_-duty-table")
+    cands.append(base_dir_from_duties.rstrip("/") + "/_-duty-table?force=1")
+    # 2) directo en /mbweb/
+    cands.append("/mbweb/_-duty-table")
+    cands.append("/mbweb/_-duty-table?force=1")
+    # 3) raíz (por si el servidor lo expone así)
+    cands.append("/_-duty-table")
+    cands.append("/_-duty-table?force=1")
+    # quitar duplicados conservando orden
+    seen=set(); out=[]
+    for u in cands:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def get_base_dir_from_duties(s: requests.Session) -> str:
+    r = http_get(s, urljoin(BASE, DUTIES_PATH))
+    # ejemplo: /mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop
     from urllib.parse import urlparse
-    p = urlparse(duties.url)
-    base_dir = re.sub(r"[^/]+$", "", p.path)  # quita 'duties'
-    # Cargar el mes por AJAX
-    ajax_url = urljoin(BASE, base_dir + "_-duty-table")
+    p = urlparse(r.url)
+    return re.sub(r"/[^/]*$", "", p.path)
+
+def fetch_month_ajax_html(s: requests.Session, base_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Intenta varias URLs para '_-duty-table' y devuelve (html, url_que_funcionó).
+    Si falla todo, devuelve (None, None).
+    """
     hdr = {
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "text/html, */*; q=0.01",
         "Referer": urljoin(BASE, DUTIES_PATH)
     }
-    month = http_get(s, ajax_url, headers=hdr).text
-    return base_dir, month
+    for rel in candidate_month_urls(base_dir):
+        url = urljoin(BASE, rel)
+        try:
+            r = http_get(s, url, headers=hdr)
+            # buscamos beginDate=YYYY-MM-DD en la carga
+            if re.search(r"beginDate=\d{4}-\d{2}-\d{2}", r.text):
+                log.info(f"_-duty-table OK vía {rel}")
+                return r.text, rel
+        except Exception:
+            continue
+    return None, None
 
 def extract_dates_and_empid(html: str) -> Tuple[List[str], Optional[str]]:
     dates = sorted(set(re.findall(r"beginDate=(\d{4}-\d{2}-\d{2})", html)))
@@ -209,19 +231,41 @@ def extract_dates_and_empid(html: str) -> Tuple[List[str], Optional[str]]:
     if m: empid = m.group(1)
     return dates, empid
 
-def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Optional[str]) -> Tuple[str, str]:
+def day_url(base_dir: str, date_ymd: str, empid: Optional[str]) -> str:
     qs = f"beginDate={date_ymd}&showUserInfo=true"
     if empid:
         qs += f"&allocatedEmployeeId={empid}"
-    rel = f"_-duty-details-day?{qs}"
-    url = urljoin(BASE, base_dir + rel)
+    # intentamos relativo al base_dir
+    return base_dir.rstrip("/") + "/_-duty-details-day?" + qs
+
+def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Optional[str]) -> Tuple[str, str]:
     hdr = {
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "text/html, */*; q=0.01",
         "Referer": urljoin(BASE, DUTIES_PATH)
     }
-    r = http_get(s, url, headers=hdr)
-    return rel, r.text
+    # probamos varias variantes: relativa, /mbweb/, raíz
+    rels = [
+        day_url(base_dir, date_ymd, empid),
+        "/mbweb/_-duty-details-day?beginDate=" + date_ymd + ("&allocatedEmployeeId="+empid if empid else "") + "&showUserInfo=true",
+        "/_-duty-details-day?beginDate=" + date_ymd + ("&allocatedEmployeeId="+empid if empid else "") + "&showUserInfo=true",
+    ]
+    tried = set()
+    for rel in rels:
+        if rel in tried: continue
+        tried.add(rel)
+        url = urljoin(BASE, rel)
+        try:
+            r = http_get(s, url, headers=hdr)
+            if r.status_code == 200 and r.text.strip():
+                return rel, r.text
+        except Exception:
+            continue
+    raise RuntimeError("No pude obtener detalle de día por ninguna ruta candidata")
+
+def iter_month_days(year: int, month: int) -> List[str]:
+    last = calendar.monthrange(year, month)[1]
+    return [f"{year:04d}-{month:02d}-{d:02d}" for d in range(1, last+1)]
 
 # ---------------- Main ----------------
 def main():
@@ -242,47 +286,65 @@ def main():
         log.info("Haciendo login en IVU…")
         do_login(s, user, pwd)
 
-        # 1) Cargar mes vía AJAX
-        base_dir, month_html = get_base_dir_and_month_html(s)
-        dates, empid = extract_dates_and_empid(month_html)
+        months = months_to_read()
+        log.info(f"Meses a leer: {months}")
 
-        if not dates:
-            log.warning("No se detectaron fechas en _-duty-table; revisa autenticación o rutas.")
-            marker = os.path.join(DATA_DIR, "NO_DATA.txt")
-            with open(marker, "w", encoding="utf-8") as f:
-                f.write("Sin fechas en _-duty-table (AJAX). Revisa selectores/rutas/cookies.\n")
-            log.info(f"Marcador escrito: {marker}")
-            return
+        for (yy, mm) in months:
+            # 1) base_dir (donde cuelgan los endpoints en tu sesión)
+            base_dir = get_base_dir_from_duties(s)
 
-        # 2) Por cada día, pedir detalle AJAX
-        by_month: Dict[str, List[Dia]] = {}
-        for ymd in dates:
-            try:
-                href, html_day = fetch_day_html(s, base_dir, ymd, empid)
-                dia = parse_day_html(ymd, html_day, href)
-                ym = ymd[:7]
-                by_month.setdefault(ym, []).append(dia)
-                if dia.status == "SERVICIO":
-                    log.info(f"[{ymd}] {dia.status} {dia.start}-{dia.end} {dia.tipo or ''} {dia.location_from or ''} → {dia.location_to or ''}")
-                else:
-                    log.info(f"[{ymd}] {dia.status}")
-            except Exception as ex:
-                log.warning(f"[{ymd}] Error leyendo día: {ex}")
+            # 2) intentar obtener HTML del mes por AJAX
+            month_html, used_url = fetch_month_ajax_html(s, base_dir)
 
-        # 3) Guardar JSON por mes
-        now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-        for ym, days in sorted(by_month.items()):
-            payload = {
-                "employee_id": empid,
-                "generated_at": now_iso,
-                "source": BASE.replace("https://","").replace("http://",""),
-                "year_month": ym,
-                "days": [asdict(d) for d in days],
-            }
-            out = os.path.join(DATA_DIR, f"turnos_{ym}.json")
-            with open(out, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            log.info(f"💾 Guardado {out} ({len(days)} días)")
+            dates: List[str] = []
+            empid: Optional[str] = None
+
+            if month_html:
+                dts, emp = extract_dates_and_empid(month_html)
+                # filtramos por el mes/ano que toca
+                dates = [d for d in dts if d.startswith(f"{yy:04d}-{mm:02d}")]
+                empid = emp
+
+            # 3) Fallback: si seguimos sin fechas, hacemos barrido día a día
+            if not dates:
+                log.warning(f"No se obtuvieron fechas por _-duty-table para {yy}-{mm:02d}. Activo barrido diario.")
+                dates = iter_month_days(yy, mm)
+
+            by_month: Dict[str, List[Dia]] = {}
+            for ymd in dates:
+                try:
+                    href, html_day = fetch_day_html(s, base_dir, ymd, empid)
+                    dia = parse_day_html(ymd, html_day, href)
+                    ym = ymd[:7]
+                    by_month.setdefault(ym, []).append(dia)
+                    if dia.status == "SERVICIO":
+                        log.info(f"[{ymd}] {dia.status} {dia.start}-{dia.end} {dia.tipo or ''} {dia.location_from or ''} → {dia.location_to or ''}")
+                    else:
+                        log.info(f"[{ymd}] {dia.status}")
+                except Exception as ex:
+                    log.warning(f"[{ymd}] Error leyendo día: {ex}")
+
+            # 4) Guardar JSON por mes
+            if by_month:
+                now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                for ym, days in sorted(by_month.items()):
+                    payload = {
+                        "employee_id": empid,
+                        "generated_at": now_iso,
+                        "source": BASE.replace("https://","").replace("http://",""),
+                        "year_month": ym,
+                        "days": [asdict(d) for d in days],
+                    }
+                    out = os.path.join(DATA_DIR, f"turnos_{ym}.json")
+                    with open(out, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                    log.info(f"💾 Guardado {out} ({len(days)} días)")
+            else:
+                # Deja rastro para depurar
+                marker = os.path.join(DATA_DIR, f"NO_DATA_{yy}-{mm:02d}.txt")
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write("No se pudo obtener información de ningún día del mes.\n")
+                log.warning(f"No se detectaron días/turnos en {yy}-{mm:02d}. Verifica rutas o credenciales.")
 
 if __name__ == "__main__":
     main()
