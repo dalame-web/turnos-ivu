@@ -34,12 +34,12 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/data"
 
-- name: Show repo files
-  run: |
-    pwd
-    ls -la
-    echo "---- git status ----"
-    git status --porcelain
+      - name: Show repo files
+        run: |
+          pwd
+          ls -la
+          echo "---- git status ----"
+          git status --porcelain
 
       - name: Run get_turnos.py
         env:
