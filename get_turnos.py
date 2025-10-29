@@ -1,84 +1,82 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Parte 1: Login a IVU + lectura de turnos + guardado a JSON por mes.
-- Lee el/los meses visibles (configurable con MESES_A_LEER).
-- Por cada día, abre el detalle, clasifica el estado y normaliza campos.
-- Genera un archivo JSON por mes en TURNOS_DATA_DIR (por defecto ./data).
 
-NOTAS:
-- Este script está preparado para adaptarse a pequeños cambios de HTML.
-- Los selectores CSS están parametrizados en SELECTORS para facilitar ajuste.
-- La detección de "dormida" se basa en cruce de medianoche y heurística simple.
-
-Autor: Blue (ChatGPT)
-"""
-
-import os
-import re
-import sys
-import json
-import time
-import hashlib
-import logging
+import os, re, sys, json, time, hashlib
 import datetime as dt
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional, Tuple
-
+from typing import List, Dict, Optional, Tuple
+import logging
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin
 
-# -----------------------------
-# Configuración y constantes
-# -----------------------------
-IVU_BASE_URL = os.getenv("IVU_BASE_URL", "https://wcrew-ilsa.trenitalia.it").rstrip("/")
-IVU_LOGIN_PATH = "/_login"  # Ajusta si tu instancia difiere
-MESES_A_LEER = int(os.getenv("MESES_A_LEER", "1"))  # 1 = mes actual; 2 = actual + siguiente
+# ---------------- Config ----------------
+BASE = os.getenv("IVU_BASE_URL", "https://wcrew-ilsa.trenitalia.it").rstrip("/")
+# En IVU tu login real es /mbweb/j_security_check (según HTML de credenciales)
+LOGIN_POST = "/mbweb/j_security_check"
+DUTIES_PATH = "/mbweb/main/ivu/desktop/duties"  # vista que define el directorio base
 DATA_DIR = os.getenv("TURNOS_DATA_DIR", "./data")
+MESES_A_LEER = int(os.getenv("MESES_A_LEER", "1"))  # actual (+1 si quieres el siguiente)
 
-# Selectores (ajústalos si IVU cambia)
-SELECTORS = {
-    "calendar_days": ".ivu-calendar .ivu-calendar-day, .calendar .day, .ivu-day",  # fallback múltiple
-    "day_href": "a[href*='duty-details-day'], a[href*='duty-details']",            # enlace a detalle de día
-    "details_header": ".duty-details-header, .duty-header, header",
-    "table_components": ".duty-components-table, table.components",
-    "table_row": ".duty-components-table-row, tr",
-    "cell_start": ".start_time, .start, td:nth-child(1)",
-    "cell_end": ".end_time, .end, td:nth-child(2)",
-    "cell_from": ".start_location_long_name, .from, td:nth-child(3)",
-    "cell_to": ".end_location_long_name, .to, td:nth-child(4)",
-    "cell_type": ".type, .component-type, td:nth-child(5)",
-    "turno_tipo_header": ".duty-type, .turn-type, .badge, .tag",
-    "labels_text": ".label, .chip, .badge",
-    "train_number": ".trip_numbers, .train, .service-no, .numero-tren",
-}
-
-# Tiempo de espera/reintento red
 HTTP_TIMEOUT = 30
-HTTP_RETRIES = 3
-RETRY_SLEEP = 1.5
+RETRIES = 3
+SLEEP = 1.2
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("get_turnos")
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("get_turnos")
 
-# -----------------------------
-# Dataclasses
-# -----------------------------
+# ---------------- Utils ----------------
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def sha256_text(t: str) -> str:
+    return "sha256:" + hashlib.sha256(t.encode("utf-8", errors="ignore")).hexdigest()
+
+def http_get(s: requests.Session, url: str, **kw) -> requests.Response:
+    last = None
+    for i in range(RETRIES):
+        try:
+            r = s.get(url, timeout=HTTP_TIMEOUT, **kw)
+            if r.status_code >= 500:
+                raise requests.RequestException(f"status {r.status_code}")
+            return r
+        except Exception as ex:
+            last = ex
+            time.sleep(SLEEP * (i+1))
+    raise last
+
+def http_post(s: requests.Session, url: str, data=None, **kw) -> requests.Response:
+    last = None
+    for i in range(RETRIES):
+        try:
+            r = s.post(url, data=data, timeout=HTTP_TIMEOUT, **kw)
+            if r.status_code >= 500:
+                raise requests.RequestException(f"status {r.status_code}")
+            return r
+        except Exception as ex:
+            last = ex
+            time.sleep(SLEEP * (i+1))
+    raise last
+
+def month_list() -> List[Tuple[int,int]]:
+    today = dt.date.today()
+    out = []
+    y, m = today.year, today.month
+    for i in range(MESES_A_LEER):
+        yy = y + (m+i-1)//12
+        mm = (m+i-1)%12 + 1
+        out.append((yy, mm))
+    return out
+
+# ---------------- Modelos ----------------
 @dataclass
-class DiaTurno:
+class Dia:
     date: str
-    status: str                        # SERVICIO | DESCANSO | LD | I | LIBRE
-    tipo: Optional[str] = None         # Código de turno p.ej "F-BC04A"
-    start: Optional[str] = None        # "HH:MM"
-    end: Optional[str] = None          # "HH:MM"
+    status: str                    # SERVICIO | DESCANSO | LD | I | LIBRE
+    tipo: Optional[str] = None
+    start: Optional[str] = None
+    end: Optional[str] = None
     overnight: bool = False
     location_from: Optional[str] = None
     location_to: Optional[str] = None
@@ -87,380 +85,204 @@ class DiaTurno:
     html_hash: Optional[str] = None
     notes: List[str] = None
 
-@dataclass
-class MesTurnos:
-    employee_id: Optional[str]
-    generated_at: str
-    source: str
-    year_month: str
-    days: List[DiaTurno]
+# ---------------- Parsers ----------------
+HORA = r"(\d{1,2}):(\d{2})"
 
-# -----------------------------
-# Utilidades
-# -----------------------------
-def sha256_text(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-def norm_hhmm(s: str) -> Optional[str]:
-    if not s:
-        return None
-    # Normaliza "8:5" -> "08:05"
-    m = re.match(r"^\s*(\d{1,2}):(\d{1,2})\s*$", s)
-    if not m: 
-        return None
+def norm_hhmm(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", s)
+    if not m: return None
     h, mm = int(m.group(1)), int(m.group(2))
     if 0 <= h < 24 and 0 <= mm < 60:
         return f"{h:02d}:{mm:02d}"
     return None
 
-def parse_time(text: str) -> Optional[str]:
-    # Extrae el primer HH:MM que aparezca
-    m = re.search(r"(\d{1,2}):(\d{2})", text or "")
-    return norm_hhmm(m.group(0)) if m else None
-
-def simplify(txt: str) -> str:
-    return re.sub(r"\s+", " ", (txt or "").strip())
-
 def detect_status(texts: List[str], has_hours: bool) -> str:
-    """
-    Heurística de estado por día según textos visibles y si hay horas.
-    """
-    joined = " ".join([t.upper() for t in texts])
-    if "LD" in joined:
-        return "LD"
-    if re.search(r"\bDESCANSO\b", joined):
-        return "DESCANSO"
-    if re.search(r"\bI\b", joined) and not has_hours:
-        return "I"
-    if has_hours:
-        return "SERVICIO"
-    return "LIBRE"
+    j = " ".join(t.upper() for t in texts)
+    if "LD" in j: return "LD"
+    if "DESCANSO" in j: return "DESCANSO"
+    if re.search(r"\bI\b", j) and not has_hours: return "I"
+    return "SERVICIO" if has_hours else "LIBRE"
 
 def is_overnight(start_hhmm: Optional[str], end_hhmm: Optional[str]) -> bool:
-    if not start_hhmm or not end_hhmm:
-        return False
-    try:
-        sh, sm = map(int, start_hhmm.split(":"))
-        eh, em = map(int, end_hhmm.split(":"))
-        start_minutes = sh * 60 + sm
-        end_minutes = eh * 60 + em
-        return end_minutes < start_minutes  # cruza medianoche
-    except Exception:
-        return False
+    if not start_hhmm or not end_hhmm: return False
+    sh, sm = map(int, start_hhmm.split(":"))
+    eh, em = map(int, end_hhmm.split(":"))
+    return (eh*60+em) < (sh*60+sm)
 
-def ensure_dir(path: str):
-    if not os.path.isdir(path):
-        os.makedirs(path, exist_ok=True)
-
-# -----------------------------
-# Sesión y login
-# -----------------------------
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; TurnosBot/1.0; +https://example.invalid)",
-        "Accept-Language": "es-ES,es;q=0.9",
-    })
-    s.timeout = HTTP_TIMEOUT
-    return s
-
-def http_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
-    last_ex = None
-    for i in range(HTTP_RETRIES):
-        try:
-            r = session.get(url, timeout=HTTP_TIMEOUT, **kwargs)
-            if r.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f"status={r.status_code}")
-            return r
-        except Exception as ex:
-            last_ex = ex
-            time.sleep(RETRY_SLEEP * (i + 1))
-    raise last_ex
-
-def http_post(session: requests.Session, url: str, data=None, **kwargs) -> requests.Response:
-    last_ex = None
-    for i in range(HTTP_RETRIES):
-        try:
-            r = session.post(url, data=data, timeout=HTTP_TIMEOUT, **kwargs)
-            if r.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f"status={r.status_code}")
-            return r
-        except Exception as ex:
-            last_ex = ex
-            time.sleep(RETRY_SLEEP * (i + 1))
-    raise last_ex
-
-def login_ivu(session: requests.Session, user: str, pwd: str) -> None:
-    login_url = urljoin(IVU_BASE_URL, IVU_LOGIN_PATH)
-    logger.info("Haciendo login en IVU…")
-    # Algunas instalaciones requieren obtener un token CSRF/hidden antes del POST:
-    r0 = http_get(session, login_url)
-    soup0 = BeautifulSoup(r0.text, "html.parser")
-    # Busca campos hidden (csrf, lt, execution, etc.)
-    payload = {}
-    for hidden in soup0.select("form input[type='hidden']"):
-        name = hidden.get("name")
-        val = hidden.get("value", "")
-        if name:
-            payload[name] = val
-    # Añade credenciales (ajusta nombres si difieren en tu instancia)
-    # Los nombres típicos: username / password
-    payload.update({
-        "username": user,
-        "password": pwd,
-    })
-    # Envía POST
-    r1 = http_post(session, login_url, data=payload)
-    if "logout" not in r1.text.lower() and "salir" not in r1.text.lower():
-        # Heurística: comprobar presencia de algo típico tras login
-        if "duty" not in r1.text.lower() and r1.url.endswith(IVU_LOGIN_PATH):
-            logger.error("Login fallido: revisa usuario/contraseña o el flujo de autenticación.")
-            raise SystemExit(1)
-    logger.info("Login correcto ✅")
-
-# -----------------------------
-# Lectura del calendario y días
-# -----------------------------
-def iter_meses_base() -> List[Tuple[int, int]]:
-    """Devuelve (year, month) a leer, empezando por el actual."""
-    today = dt.date.today()
-    res = []
-    y, m = today.year, today.month
-    for i in range(MESES_A_LEER):
-        yy = y + (m + i - 1) // 12
-        mm = (m + i - 1) % 12 + 1
-        res.append((yy, mm))
-    return res
-
-def month_overview_url(year: int, month: int) -> str:
-    # Ajusta la ruta si tu instancia usa otra
-    # Ejemplo típico: /_duty-calendar?year=YYYY&month=MM
-    params = {"year": year, "month": f"{month:02d}"}
-    return urljoin(IVU_BASE_URL, "/_duty-calendar?" + urlencode(params))
-
-def read_month_overview(session: requests.Session, year: int, month: int) -> BeautifulSoup:
-    url = month_overview_url(year, month)
-    r = http_get(session, url)
-    return BeautifulSoup(r.text, "html.parser")
-
-def find_day_links(soup_calendar: BeautifulSoup) -> Dict[str, str]:
-    """
-    Devuelve dict {YYYY-MM-DD: href_detalle}
-    """
-    links = {}
-    for day in soup_calendar.select(SELECTORS["calendar_days"]):
-        # intenta sacar la fecha de data-* o texto
-        date_attr = day.get("data-date") or day.get("data-day") or ""
-        date_txt = simplify(day.text)
-        date_str = None
-
-        # 1) data-date (YYYY-MM-DD)
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", date_attr)
-        if m:
-            date_str = m.group(1)
-        else:
-            # 2) intenta parsear por atributos alternativos
-            m2 = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", date_attr)
-            if m2:
-                y, mo, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
-                date_str = f"{y:04d}-{mo:02d}-{d:02d}"
-
-        # fallback: si no hay atributo, puede que haya un link con beginDate
-        href_a = day.select_one(SELECTORS["day_href"])
-        if not href_a:
-            # intenta encontrar links dentro del día:
-            a = day.find("a", href=True)
-            if a and ("duty" in a["href"] or "beginDate" in a["href"]):
-                href_a = a
-
-        if href_a:
-            href = href_a.get("href", "")
-            # extrae fecha del href si no la teníamos
-            if not date_str:
-                m3 = re.search(r"beginDate=([0-9]{4}-[0-9]{2}-[0-9]{2})", href)
-                if m3:
-                    date_str = m3.group(1)
-
-            if date_str:
-                links[date_str] = href
-
-    return links
-
-def read_day_details(session: requests.Session, href: str) -> Tuple[str, BeautifulSoup]:
-    url = urljoin(IVU_BASE_URL, href)
-    r = http_get(session, url)
-    return r.text, BeautifulSoup(r.text, "html.parser")
-
-def extract_texts(el) -> List[str]:
-    if not el:
-        return []
-    texts = []
-    for node in el.stripped_strings:
-        t = simplify(node)
-        if t:
-            texts.append(t)
-    return texts
-
-def parse_day(date_str: str, href: str, html_text: str, soup_day: BeautifulSoup) -> DiaTurno:
-    header = soup_day.select_one(SELECTORS["details_header"])
-    table = soup_day.select_one(SELECTORS["table_components"])
-
-    tipo = None
+def parse_day_html(date_str: str, html: str, href: str) -> Dia:
+    soup = BeautifulSoup(html, "html.parser")
+    # cabecera/tabla (cuando IVU la pinta)
+    head = soup.select_one("table.allocation-info, table.duty_header_attribute, table.table-header-block")
+    body = soup.select_one("table.duty-components-table")
+    tipo = None; start=None; end=None; f=None; t=None; tren=None
     labels = []
-    start_hhmm = None
-    end_hhmm = None
-    loc_from = None
-    loc_to = None
-    train_no = None
 
-    if header:
-        # intenta detectar tipo de turno (código) en cabecera
-        tipo_el = header.select_one(SELECTORS["turno_tipo_header"])
+    # tipo desde cabecera (si existe)
+    if head:
+        # buscar texto general
+        labels.append(head.get_text(" ", strip=True))
+
+    if body:
+        # horas: primera start y última end
+        starts = [td.get_text(" ", strip=True) for td in body.select("td.start_time")]
+        ends   = [td.get_text(" ", strip=True) for td in body.select("td.end_time")]
+        locs_f = [td.get_text(" ", strip=True) for td in body.select("td.start_location_long_name")]
+        locs_t = [td.get_text(" ", strip=True) for td in body.select("td.end_location_long_name")]
+        if starts: start = norm_hhmm(starts[0])
+        if ends:   end   = norm_hhmm(ends[-1])
+        if locs_f: f = locs_f[0]
+        if locs_t: t = locs_t[-1]
+        # tipo aproximado
+        tipo_el = body.select_one("td.component-type, td.type")
         if tipo_el:
-            tipo = simplify(tipo_el.text)
-        labels.extend(extract_texts(header.select_one(SELECTORS["labels_text"])))
+            tipo = tipo_el.get_text(" ", strip=True) or None
+        labels.append(body.get_text(" ", strip=True))
+        # tren
+        trips = [td.get_text(" ", strip=True) for td in body.select("td.trip_numbers")]
+        first = next((x for x in trips if x), "")
+        m = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", first) if first else None
+        if m: tren = m.group(1)
+        if not tren:
+            m2 = re.search(r"\b([A-Z]{1,3}\d{2,5}|\d{3,5})\b", body.get_text(" ", strip=True))
+            tren = m2.group(1) if m2 else None
 
-    has_hours = False
+    # fallback: horas por regex global
+    if not start or not end:
+        horas = re.findall(HORA, soup.get_text(" ", strip=True))
+        if horas:
+            if not start: start = norm_hhmm(":".join(horas[0]))
+            if not end:   end   = norm_hhmm(":".join(horas[-1]))
 
-    if table:
-        # Recorre filas y toma el primer start y el último end
-        rows = table.select(SELECTORS["table_row"])
-        for i, row in enumerate(rows):
-            row_txt = simplify(row.get_text(" ", strip=True))
-            # detecta tipo de componente (Descanso, LD, etc.)
-            # recoge horas y ubicaciones si están
-            start_cell = row.select_one(SELECTORS["cell_start"])
-            end_cell   = row.select_one(SELECTORS["cell_end"])
-            from_cell  = row.select_one(SELECTORS["cell_from"])
-            to_cell    = row.select_one(SELECTORS["cell_to"])
-            type_cell  = row.select_one(SELECTORS["cell_type"])
-            train_cell = row.select_one(SELECTORS["train_number"])
-
-            st = parse_time(start_cell.text) if start_cell else None
-            en = parse_time(end_cell.text) if end_cell else None
-            if st and not start_hhmm:
-                start_hhmm = st
-            if en:
-                end_hhmm = en  # el último 'end' se queda
-            if from_cell and not loc_from:
-                loc_from = simplify(from_cell.text)
-            if to_cell:
-                loc_to = simplify(to_cell.text)
-            if type_cell:
-                labels.append(simplify(type_cell.text))
-            if train_cell and not train_no:
-                tn = simplify(train_cell.text)
-                # normaliza (solo dígitos/letras)
-                tn = re.sub(r"[^A-Za-z0-9\- ]+", "", tn)
-                train_no = tn if tn else None
-
-        has_hours = bool(start_hhmm and end_hhmm)
-
+    has_hours = bool(start and end)
     status = detect_status(labels, has_hours)
-    overnight = is_overnight(start_hhmm, end_hhmm)
+    overnight = is_overnight(start, end)
 
-    return DiaTurno(
-        date=date_str,
-        status=status,
-        tipo=tipo,
-        start=start_hhmm,
-        end=end_hhmm,
-        overnight=overnight,
-        location_from=loc_from,
-        location_to=loc_to,
-        train_number=train_no,
-        raw_frag_href=href,
-        html_hash=sha256_text(html_text),
-        notes=[],
+    return Dia(
+        date=date_str, status=status, tipo=tipo,
+        start=start, end=end, overnight=overnight,
+        location_from=f, location_to=t, train_number=tren,
+        raw_frag_href=href, html_hash=sha256_text(html),
+        notes=[]
     )
 
-# -----------------------------
-# Flujo principal
-# -----------------------------
+# ---------------- Core (AJAX endpoints) ----------------
+def do_login(s: requests.Session, user: str, pwd: str):
+    # Necesitamos cookie de sesión de /mbweb/ antes del POST
+    landing = http_get(s, urljoin(BASE, "/mbweb/"))
+    # POST del formulario estándar j_security_check
+    data = {"j_username": user, "j_password": pwd}
+    r = http_post(s, urljoin(BASE, LOGIN_POST), data=data)
+    if r.status_code not in (200, 302):
+        raise RuntimeError("Login HTTP inesperado")
+    # comprobar que entrar en duties responde autenticado
+    r2 = http_get(s, urljoin(BASE, DUTIES_PATH))
+    if "Cerrar sesión" not in r2.text and "logout" not in r2.text.lower():
+        raise RuntimeError("Login fallido (no aparece sesión activa)")
+    log.info("Login correcto ✅")
+
+def get_base_dir_and_month_html(s: requests.Session) -> Tuple[str, str]:
+    """
+    Abre /duties para obtener el directorio base (/mbweb/main/ivu/desktop/)
+    y pide por AJAX '_-duty-table' para volcar el HTML del mes.
+    """
+    duties = http_get(s, urljoin(BASE, DUTIES_PATH))
+    # Obtener el directorio base de la URL final:
+    # p.ej. https://.../mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop/
+    from urllib.parse import urlparse
+    p = urlparse(duties.url)
+    base_dir = re.sub(r"[^/]+$", "", p.path)  # quita 'duties'
+    # Cargar el mes por AJAX
+    ajax_url = urljoin(BASE, base_dir + "_-duty-table")
+    hdr = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "text/html, */*; q=0.01",
+        "Referer": urljoin(BASE, DUTIES_PATH)
+    }
+    month = http_get(s, ajax_url, headers=hdr).text
+    return base_dir, month
+
+def extract_dates_and_empid(html: str) -> Tuple[List[str], Optional[str]]:
+    dates = sorted(set(re.findall(r"beginDate=(\d{4}-\d{2}-\d{2})", html)))
+    empid = None
+    m = re.search(r"allocatedEmployeeId=(\d+)", html)
+    if m: empid = m.group(1)
+    return dates, empid
+
+def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Optional[str]) -> Tuple[str, str]:
+    qs = f"beginDate={date_ymd}&showUserInfo=true"
+    if empid:
+        qs += f"&allocatedEmployeeId={empid}"
+    rel = f"_-duty-details-day?{qs}"
+    url = urljoin(BASE, base_dir + rel)
+    hdr = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "text/html, */*; q=0.01",
+        "Referer": urljoin(BASE, DUTIES_PATH)
+    }
+    r = http_get(s, url, headers=hdr)
+    return rel, r.text
+
+# ---------------- Main ----------------
 def main():
-    user = os.getenv("IVU_USER")
-    pwd  = os.getenv("IVU_PASS")
+    user = os.getenv("IVU_USER"); pwd = os.getenv("IVU_PASS")
     if not user or not pwd:
-        logger.error("Faltan variables de entorno IVU_USER / IVU_PASS.")
-        sys.exit(1)
+        log.error("Faltan IVU_USER / IVU_PASS"); sys.exit(1)
 
     ensure_dir(DATA_DIR)
 
-    session = make_session()
-    login_ivu(session, user, pwd)
+    with requests.Session() as s:
+        s.headers.update({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/118.0.0.0 Safari/537.36"),
+            "Accept-Language": "es-ES,es;q=0.9",
+        })
 
-    months = iter_meses_base()
-    logger.info(f"Meses a leer: {months}")
+        log.info("Haciendo login en IVU…")
+        do_login(s, user, pwd)
 
-    all_days: Dict[str, List[DiaTurno]] = {}  # "YYYY-MM" -> list[DiaTurno]
+        # 1) Cargar mes vía AJAX
+        base_dir, month_html = get_base_dir_and_month_html(s)
+        dates, empid = extract_dates_and_empid(month_html)
 
-    for (yy, mm) in months:
-        soup_cal = read_month_overview(session, yy, mm)
-        links = find_day_links(soup_cal)
-        logger.info(f"[{yy}-{mm:02d}] Días detectados: {len(links)}")
+        if not dates:
+            log.warning("No se detectaron fechas en _-duty-table; revisa autenticación o rutas.")
+            marker = os.path.join(DATA_DIR, "NO_DATA.txt")
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("Sin fechas en _-duty-table (AJAX). Revisa selectores/rutas/cookies.\n")
+            log.info(f"Marcador escrito: {marker}")
+            return
 
-        for date_str, href in sorted(links.items()):
+        # 2) Por cada día, pedir detalle AJAX
+        by_month: Dict[str, List[Dia]] = {}
+        for ymd in dates:
             try:
-                html_text, soup_day = read_day_details(session, href)
-                dia = parse_day(date_str, href, html_text, soup_day)
-
-                ym = date_str[:7]
-                all_days.setdefault(ym, []).append(dia)
-
-                # Log amigable
+                href, html_day = fetch_day_html(s, base_dir, ymd, empid)
+                dia = parse_day_html(ymd, html_day, href)
+                ym = ymd[:7]
+                by_month.setdefault(ym, []).append(dia)
                 if dia.status == "SERVICIO":
-                    logger.info(f"[{date_str}] {dia.status} {dia.start}-{dia.end} {dia.tipo or ''} {dia.location_from or ''} → {dia.location_to or ''}")
+                    log.info(f"[{ymd}] {dia.status} {dia.start}-{dia.end} {dia.tipo or ''} {dia.location_from or ''} → {dia.location_to or ''}")
                 else:
-                    logger.info(f"[{date_str}] {dia.status}")
+                    log.info(f"[{ymd}] {dia.status}")
             except Exception as ex:
-                logger.warning(f"[{date_str}] Error leyendo día: {ex}")
-                continue
+                log.warning(f"[{ymd}] Error leyendo día: {ex}")
 
-    # Guardado por mes
-    # employee_id: si la UI lo muestra en alguna parte, puedes extraerlo y setearlo aquí.
-    employee_id = None
-    now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-
-    for ym, days in sorted(all_days.items()):
-        out = MesTurnos(
-            employee_id=employee_id,
-            generated_at=now_iso,
-            source=IVU_BASE_URL.replace("https://", "").replace("http://", ""),
-            year_month=ym,
-            days=days,
-        )
-
-        # dataclass -> dict -> JSON serializable
-        payload = {
-            "employee_id": out.employee_id,
-            "generated_at": out.generated_at,
-            "source": out.source,
-            "year_month": out.year_month,
-            "days": [asdict(d) for d in out.days],
-        }
-
-        outfile = os.path.join(DATA_DIR, f"turnos_{ym}.json")
-        with open(outfile, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-
-        logger.info(f"💾 Guardado {outfile} ({len(days)} días)")
-
-    if not all_days:
-        logger.warning("No se detectaron días/turnos. Revisa selectores o accesos.")
-    
-    # --- Al final de main() ---
-    if not all_days:
-        logger.warning("No se detectaron días/turnos. Revisa selectores o accesos.")
-        marker = os.path.join(DATA_DIR, "NO_DATA.txt")
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(
-                "No se generaron JSON de turnos.\n"
-                "Posibles causas:\n"
-                "- Login correcto pero sin días detectados en el mes.\n"
-                "- Selectores HTML desajustados.\n"
-                "- La vista del calendario no responde/URL distinta.\n"
-            )
-        logger.info(f"Marcador escrito: {marker}")
+        # 3) Guardar JSON por mes
+        now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        for ym, days in sorted(by_month.items()):
+            payload = {
+                "employee_id": empid,
+                "generated_at": now_iso,
+                "source": BASE.replace("https://","").replace("http://",""),
+                "year_month": ym,
+                "days": [asdict(d) for d in days],
+            }
+            out = os.path.join(DATA_DIR, f"turnos_{ym}.json")
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            log.info(f"💾 Guardado {out} ({len(days)} días)")
 
 if __name__ == "__main__":
     main()
