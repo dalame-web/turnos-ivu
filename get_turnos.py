@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+VERSION = "get_turnos v1.3-debug"
 
+import sys
+print(f"=== {VERSION} ===", file=sys.stderr)
 import os, re, sys, json, time, hashlib, calendar
 import datetime as dt
 from dataclasses import dataclass, asdict
