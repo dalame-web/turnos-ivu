@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-VERSION = "get_turnos v1.3-debug"
+VERSION = "get_turnos v1.4-login-robusto"
 
-import sys
-print(f"=== {VERSION} ===", file=sys.stderr)
 import os, re, sys, json, time, hashlib, calendar
 import datetime as dt
 from dataclasses import dataclass, asdict
@@ -16,15 +14,15 @@ from urllib.parse import urljoin, urlparse
 # ---------------- Config ----------------
 BASE = os.getenv("IVU_BASE_URL", "https://wcrew-ilsa.trenitalia.it").rstrip("/")
 LOGIN_POST = "/mbweb/j_security_check"
-# Página visible de turnos (nos da el "entorno" y cookies correctas)
 DUTIES_PATH = "/mbweb/main/ivu/desktop/duties"
 
 DATA_DIR = os.getenv("TURNOS_DATA_DIR", "./data")
 MESES_A_LEER = int(os.getenv("MESES_A_LEER", "1"))  # 1 = mes actual, 2 = actual + siguiente
 
-HTTP_TIMEOUT = 30
-RETRIES = 3
-SLEEP = 1.2
+# Timeouts y reintentos robustos
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SEC", "90"))
+RETRIES = int(os.getenv("HTTP_RETRIES", "5"))
+SLEEP_BASE = float(os.getenv("HTTP_BACKOFF", "1.5"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,31 +38,41 @@ def ensure_dir(p: str):
 def sha256_text(t: str) -> str:
     return "sha256:" + hashlib.sha256(t.encode("utf-8", errors="ignore")).hexdigest()
 
-def http_get(s: requests.Session, url: str, **kw) -> requests.Response:
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
+def snapshot(name: str, content: str):
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"[DEBUG] snapshot -> {path}")
+    except Exception as e:
+        log.warning(f"[DEBUG] no se pudo escribir snapshot {name}: {e}")
+
+def http_req(s: requests.Session, method: str, url: str, **kw) -> requests.Response:
+    """
+    Envoltorio con reintentos + backoff. Captura y reintenta timeouts/transitorios.
+    """
     last = None
     for i in range(RETRIES):
         try:
-            r = s.get(url, timeout=HTTP_TIMEOUT, **kw)
+            r = s.request(method, url, timeout=HTTP_TIMEOUT, **kw)
+            # Trata 5xx como transitorios
             if r.status_code >= 500:
                 raise requests.RequestException(f"status {r.status_code}")
             return r
         except Exception as ex:
             last = ex
-            time.sleep(SLEEP * (i+1))
+            sleep = SLEEP_BASE * (i + 1)
+            log.warning(f"[HTTP {method}] Intento {i+1}/{RETRIES} fallo: {ex} -> reintentando en {sleep:.1f}s")
+            time.sleep(sleep)
     raise last
 
-def http_post(s: requests.Session, url: str, data=None, **kw) -> requests.Response:
-    last = None
-    for i in range(RETRIES):
-        try:
-            r = s.post(url, data=data, timeout=HTTP_TIMEOUT, **kw)
-            if r.status_code >= 500:
-                raise requests.RequestException(f"status {r.status_code}")
-            return r
-        except Exception as ex:
-            last = ex
-            time.sleep(SLEEP * (i+1))
-    raise last
+def http_get(s: requests.Session, url: str, **kw) -> requests.Response:
+    return http_req(s, "GET", url, **kw)
+
+def http_post(s: requests.Session, url: str, **kw) -> requests.Response:
+    return http_req(s, "POST", url, **kw)
 
 def months_to_read() -> List[Tuple[int,int]]:
     today = dt.date.today()
@@ -169,27 +177,51 @@ def parse_day_html(date_str: str, html: str, href: str) -> Dia:
 
 # ---------------- Core ----------------
 def do_login(s: requests.Session, user: str, pwd: str):
-    # Entramos primero a /mbweb para obtener cookies base
-    _ = http_get(s, urljoin(BASE, "/mbweb/"))
+    """
+    Login robusto:
+    - Pre-GET de /mbweb/ para cookies base (snapshot).
+    - POST a /mbweb/j_security_check con cabeceras realistas (snapshot de estado).
+    - GET a /duties para verificar sesión (snapshot).
+    """
+    # Cabeceras comunes
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/118.0.0.0 Safari/537.36"),
+        "Accept-Language": "es-ES,es;q=0.9",
+    })
+
+    # 1) PRE-GET
+    pre = http_get(s, urljoin(BASE, "/mbweb/"))
+    snapshot("LOGIN_PRE.html", pre.text)
+
+    # 2) POST j_security_check
     data = {"j_username": user, "j_password": pwd}
-    _ = http_post(s, urljoin(BASE, LOGIN_POST), data=data)
-    # Verificación mínima
-    r2 = http_get(s, urljoin(BASE, DUTIES_PATH))
+    headers = {
+        "Origin": BASE,
+        "Referer": urljoin(BASE, "/mbweb/"),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    post = http_post(s, urljoin(BASE, LOGIN_POST), data=data, headers=headers)
+    # snapshot del status y parte del cuerpo (no siempre devuelve HTML útil)
+    snapshot("LOGIN_POST_status.txt", f"status={post.status_code}\nurl={post.url}\nheaders={dict(post.headers)}\n")
+
+    # 3) Verificación de sesión en /duties
+    r2 = http_get(s, urljoin(BASE, DUTIES_PATH), headers={"Referer": urljoin(BASE, "/mbweb/")})
+    snapshot("LOGIN_AFTER.html", r2.text)
+
     if "Cerrar sesión" not in r2.text and "logout" not in r2.text.lower():
         raise RuntimeError("Login fallido (no aparece sesión activa)")
+
     log.info("Login correcto ✅")
-    return r2  # devolvemos la respuesta de duties para snapshot
+    return r2
 
 def get_base_dir_from_duties_url(duties_url: str) -> str:
-    # ejemplo: /mbweb/main/ivu/desktop/duties  -> base_dir = /mbweb/main/ivu/desktop
     p = urlparse(duties_url)
     return re.sub(r"/[^/]*$", "", p.path)
 
 def candidate_month_urls(base_dir_from_duties: str) -> List[str]:
-    """
-    Devuelve posibles rutas AJAX para _-duty-table.
-    En tu portal puede estar colgado en varias ubicaciones.
-    """
     bd = base_dir_from_duties.rstrip("/")
     cands = [
         f"{bd}/_-duty-table",
@@ -199,7 +231,6 @@ def candidate_month_urls(base_dir_from_duties: str) -> List[str]:
         "/_-duty-table",
         "/_-duty-table?force=1",
     ]
-    # quitar duplicados conservando orden
     seen=set(); out=[]
     for u in cands:
         if u not in seen:
@@ -207,10 +238,6 @@ def candidate_month_urls(base_dir_from_duties: str) -> List[str]:
     return out
 
 def fetch_month_ajax_html(s: requests.Session, base_dir: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Intenta varias URLs para '_-duty-table' y devuelve (html, url_que_funcionó).
-    Si falla todo, devuelve (None, None).
-    """
     hdr = {
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "text/html, */*; q=0.01",
@@ -220,11 +247,11 @@ def fetch_month_ajax_html(s: requests.Session, base_dir: str) -> Tuple[Optional[
         url = urljoin(BASE, rel)
         try:
             r = http_get(s, url, headers=hdr)
-            # buscamos beginDate=YYYY-MM-DD en la carga
             if re.search(r"beginDate=\d{4}-\d{2}-\d{2}", r.text):
                 log.info(f"_-duty-table OK vía {rel}")
                 return r.text, rel
-        except Exception:
+        except Exception as ex:
+            log.warning(f"_-duty-table fallo vía {rel}: {ex}")
             continue
     return None, None
 
@@ -239,7 +266,6 @@ def day_url(base_dir: str, date_ymd: str, empid: Optional[str]) -> str:
     qs = f"beginDate={date_ymd}&showUserInfo=true"
     if empid:
         qs += f"&allocatedEmployeeId={empid}"
-    # intentamos relativo al base_dir
     return base_dir.rstrip("/") + "/_-duty-details-day?" + qs
 
 def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Optional[str]) -> Tuple[str, str]:
@@ -248,7 +274,6 @@ def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Opt
         "Accept": "text/html, */*; q=0.01",
         "Referer": urljoin(BASE, DUTIES_PATH)
     }
-    # probamos varias variantes: relativa, /mbweb/, raíz
     rels = [
         day_url(base_dir, date_ymd, empid),
         "/mbweb/_-duty-details-day?beginDate=" + date_ymd + ("&allocatedEmployeeId="+empid if empid else "") + "&showUserInfo=true",
@@ -259,32 +284,18 @@ def fetch_day_html(s: requests.Session, base_dir: str, date_ymd: str, empid: Opt
         if rel in tried: continue
         tried.add(rel)
         url = urljoin(BASE, rel)
-        try:
-            r = http_get(s, url, headers=hdr)
-            if r.status_code == 200 and r.text.strip():
-                return rel, r.text
-        except Exception:
-            continue
+        r = http_get(s, url, headers=hdr)
+        if r.status_code == 200 and r.text.strip():
+            return rel, r.text
     raise RuntimeError("No pude obtener detalle de día por ninguna ruta candidata")
 
 def iter_month_days(year: int, month: int) -> List[str]:
     last = calendar.monthrange(year, month)[1]
     return [f"{year:04d}-{month:02d}-{d:02d}" for d in range(1, last+1)]
 
-# === DEBUG helper ===
-DEBUG_DIR = os.path.join(DATA_DIR, "debug")
-def snapshot(name: str, content: str):
-    try:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        path = os.path.join(DEBUG_DIR, name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        log.info(f"[DEBUG] snapshot -> {path}")
-    except Exception as e:
-        log.warning(f"[DEBUG] no se pudo escribir snapshot {name}: {e}")
-
 # ---------------- Main ----------------
 def main():
+    print(f"=== {VERSION} ===", file=sys.stderr)
     user = os.getenv("IVU_USER"); pwd = os.getenv("IVU_PASS")
     if not user or not pwd:
         log.error("Faltan IVU_USER / IVU_PASS"); sys.exit(1)
@@ -300,9 +311,13 @@ def main():
         })
 
         log.info("Haciendo login en IVU…")
-        r_duties = do_login(s, user, pwd)
-        # --- DEBUG 1: snapshot de la vista duties y base_dir calculado
-        snapshot("00_duties.html", r_duties.text)
+        try:
+            r_duties = do_login(s, user, pwd)
+        except Exception as ex:
+            snapshot("LOGIN_ERROR.txt", f"{type(ex).__name__}: {ex}")
+            raise
+
+        # DEBUG base_dir
         base_dir = get_base_dir_from_duties_url(r_duties.url)
         log.info(f"[DEBUG] base_dir calculado = {base_dir}")
 
@@ -310,7 +325,6 @@ def main():
         log.info(f"Meses a leer: {months}")
 
         for (yy, mm) in months:
-            # 1) intentar obtener HTML del mes por AJAX
             month_html, used_url = fetch_month_ajax_html(s, base_dir)
             log.info(f"[DEBUG] _-duty-table usado = {used_url}")
             if month_html:
@@ -321,27 +335,23 @@ def main():
 
             if month_html:
                 dts, emp = extract_dates_and_empid(month_html)
-                # filtramos por el mes/ano que toca
                 dates = [d for d in dts if d.startswith(f"{yy:04d}-{mm:02d}")]
                 empid = emp
             log.info(f"[{yy}-{mm:02d}] Fechas encontradas en _-duty-table: {len(dates)}")
 
-            # 2) Fallback: si seguimos sin fechas, barrido diario
             if not dates:
                 log.warning(f"No se obtuvieron fechas por _-duty-table para {yy}-{mm:02d}. Activo barrido diario.")
                 dates = iter_month_days(yy, mm)
 
             by_month: Dict[str, List[Dia]] = {}
-            tested = 0  # para snapshots de los 3 primeros días
+            tested = 0
             for ymd in dates:
                 try:
                     href, html_day = fetch_day_html(s, base_dir, ymd, empid)
-                    # --- DEBUG 2: snapshot de los primeros 3 días probados
                     if tested < 3:
                         snapshot(f"day_{ymd}.html", html_day)
                         log.info(f"[DEBUG] Probed day URL = {href}")
                         tested += 1
-
                     dia = parse_day_html(ymd, html_day, href)
                     ym = ymd[:7]
                     by_month.setdefault(ym, []).append(dia)
@@ -352,7 +362,6 @@ def main():
                 except Exception as ex:
                     log.warning(f"[{ymd}] Error leyendo día: {ex}")
 
-            # 3) Guardar JSON por mes
             if by_month:
                 now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
                 for ym, days in sorted(by_month.items()):
@@ -368,12 +377,11 @@ def main():
                         json.dump(payload, f, ensure_ascii=False, indent=2)
                     log.info(f"💾 Guardado {out} ({len(days)} días)")
             else:
-                # Deja rastro para depurar
                 marker = os.path.join(DATA_DIR, f"NO_DATA_{yy}-{mm:02d}.txt")
                 with open(marker, "w", encoding="utf-8") as f:
                     f.write("No se pudo obtener información de ningún día del mes.\n")
                 log.warning(f"No se detectaron días/turnos en {yy}-{mm:02d}. Verifica rutas o credenciales.")
 
 if __name__ == "__main__":
+    import sys
     main()
-
