@@ -11,6 +11,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show head commit and file header
+        run: |
+          git log -1 --oneline
+          echo "----- HEAD of get_turnos_v13.py -----"
+          sed -n '1,30p' get_turnos_v13.py || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,35 +30,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Pre-create data dir (absolute path)
+      - name: Pre-create data dir
         run: |
           mkdir -p "$GITHUB_WORKSPACE/data"
-          echo "Workspace is: $GITHUB_WORKSPACE"
-          pwd
-          ls -la
 
-      - name: Run get_turnos.py
+      - name: Run get_turnos_v13.py
         env:
           IVU_USER: ${{ secrets.IVU_USER }}
           IVU_PASS: ${{ secrets.IVU_PASS }}
-          # Fuerzo dir absoluto para evitar problemas de cwd
           TURNOS_DATA_DIR: ${{ github.workspace }}/data
-          # Opcionales:
-          # IVU_BASE_URL: https://wcrew-ilsa.trenitalia.it
-          # MESES_A_LEER: "1"
         run: |
-          python get_turnos.py
-          echo "---- After run (tree):"
-          ls -la "$GITHUB_WORKSPACE"
-          echo "---- Data dir contents:"
-          ls -la "$GITHUB_WORKSPACE/data" || true
+          python get_turnos_v13.py
 
-      - name: Upload JSON artifact
+      - name: List outputs
+        if: always()
+        run: |
+          echo "---- Workspace ----"
+          ls -la "$GITHUB_WORKSPACE"
+          echo "---- data ----"
+          ls -la "$GITHUB_WORKSPACE/data" || true
+          echo "---- data/debug ----"
+          ls -la "$GITHUB_WORKSPACE/data/debug" || true
+
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: turnos-json
-          path: |
-            ${{ github.workspace }}/data/**
+          path: ${{ github.workspace }}/data/**
           if-no-files-found: warn
-
