@@ -1,16 +1,13 @@
 name: get-turnos (Parte 1)
 
 on:
-  workflow_dispatch: {}   # permite "Run workflow" manual desde Actions
-  # programado opcional para pruebas nocturnas:
-  # schedule:
-  #   - cron: "15 3 * * *"  # 03:15 UTC
+  workflow_dispatch: {}
 
 jobs:
   run-get-turnos:
     runs-on: ubuntu-latest
     permissions:
-      contents: read   # no vamos a hacer push en esta prueba
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,21 +22,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
+      - name: Pre-create data dir (absolute path)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/data"
+          echo "Workspace is: $GITHUB_WORKSPACE"
+          pwd
+          ls -la
+
       - name: Run get_turnos.py
         env:
           IVU_USER: ${{ secrets.IVU_USER }}
           IVU_PASS: ${{ secrets.IVU_PASS }}
+          # Fuerzo dir absoluto para evitar problemas de cwd
+          TURNOS_DATA_DIR: ${{ github.workspace }}/data
           # Opcionales:
           # IVU_BASE_URL: https://wcrew-ilsa.trenitalia.it
-          # TURNOS_DATA_DIR: ./data
           # MESES_A_LEER: "1"
         run: |
           python get_turnos.py
+          echo "---- After run (tree):"
+          ls -la "$GITHUB_WORKSPACE"
+          echo "---- Data dir contents:"
+          ls -la "$GITHUB_WORKSPACE/data" || true
 
       - name: Upload JSON artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: turnos-json
-          path: data/
+          path: ${{ github.workspace }}/data/**
           if-no-files-found: warn
